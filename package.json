@@ -7,7 +7,7 @@
     "start": "node bot.js"
   },
   "dependencies": {
-    "whatsapp-web.js": "^1.23.0",
+    "whatsapp-web.js": "^1.31.0",
     "wwebjs-mongo": "^1.1.0",
     "mongoose": "^8.4.0",
     "qrcode": "^1.5.3",

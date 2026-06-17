@@ -9,6 +9,8 @@ const { MongoStore } = require('wwebjs-mongo');
 const PORT      = process.env.PORT || 3000;
 const API_BASE  = process.env.API_BASE_URL || 'http://localhost:3000';
 const MONGO_URI = process.env.MONGO_URI;
+// Digits only, with country code, no "+" — e.g. 233241234567. Leave unset to use QR instead.
+const PAIR_PHONE_NUMBER = process.env.PAIR_PHONE_NUMBER || null;
 
 if (!MONGO_URI) {
   console.error('❌ MONGO_URI is not set.');
@@ -24,8 +26,9 @@ function getSession(id) {
   return sessions.get(id);
 }
 
-let latestQr = null;
-let isReady  = false;
+let latestQr   = null;
+let latestCode = null;
+let isReady    = false;
 
 const HELP = `*Kalypo Mods Bot* — commands:
 
@@ -46,7 +49,7 @@ async function start() {
   console.log('✅ Mongo connected (used for WhatsApp session storage)');
 
   const store = new MongoStore({ mongoose });
-  const client = new Client({
+  const clientOptions = {
     authStrategy: new RemoteAuth({
       store,
       backupSyncIntervalMs: 5 * 60 * 1000
@@ -55,16 +58,34 @@ async function start() {
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox']
     }
-  });
+  };
+
+  if (PAIR_PHONE_NUMBER) {
+    clientOptions.pairWithPhoneNumber = {
+      phoneNumber: PAIR_PHONE_NUMBER,
+      showNotification: true
+    };
+    console.log(`🔢 Will request a pairing code for +${PAIR_PHONE_NUMBER} instead of a QR code.`);
+  }
+
+  const client = new Client(clientOptions);
 
   client.on('qr', qr => {
-    latestQr = qr;
+    if (!PAIR_PHONE_NUMBER) {
+      latestQr = qr;
+      isReady = false;
+      console.log('📷 New QR generated — open /qr in your browser to scan it.');
+    }
+  });
+  client.on('code', code => {
+    latestCode = code;
     isReady = false;
-    console.log('📷 New QR generated — open /qr in your browser to scan it.');
+    console.log(`🔢 Pairing code: ${code} — open /qr in your browser to view it.`);
   });
   client.on('ready', () => {
     isReady = true;
     latestQr = null;
+    latestCode = null;
     console.log('✅ WhatsApp bot is ready.');
   });
   client.on('auth_failure', m => console.error('❌ Auth failure:', m));
@@ -171,7 +192,16 @@ async function start() {
 
   app.get('/qr', async (req, res) => {
     if (isReady) return res.send('<h2>✅ Already connected — nothing to scan.</h2>');
-    if (!latestQr) return res.send('<h2>⏳ Generating QR code… refresh in a few seconds.</h2>');
+
+    if (latestCode) {
+      return res.send(`
+        <h2>Enter this code on your phone</h2>
+        <p>WhatsApp → Settings → Linked Devices → Link a Device → "Link with phone number instead"</p>
+        <h1 style="font-size:48px;letter-spacing:8px;font-family:monospace;">${latestCode}</h1>
+        <p><small>Codes expire after a few minutes — refresh this page to get a new one if it stops working.</small></p>
+      `);
+    }
+    if (!latestQr) return res.send('<h2>⏳ Generating code… refresh in a few seconds.</h2>');
     const dataUrl = await qrcode.toDataURL(latestQr);
     res.send(`<h2>Scan with WhatsApp → Linked Devices</h2><img src="${dataUrl}" />`);
   });
