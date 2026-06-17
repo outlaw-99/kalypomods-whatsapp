@@ -6,6 +6,9 @@ const axios    = require('axios');
 const { Client, RemoteAuth } = require('whatsapp-web.js');
 const { MongoStore } = require('wwebjs-mongo');
 
+process.on('uncaughtException', err => console.error('💥 Uncaught exception:', err));
+process.on('unhandledRejection', err => console.error('💥 Unhandled rejection:', err));
+
 const PORT      = process.env.PORT || 3000;
 const API_BASE  = process.env.API_BASE_URL || 'http://localhost:3000';
 const MONGO_URI = process.env.MONGO_URI;
