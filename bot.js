@@ -13,7 +13,7 @@ http.createServer((req, res) => {
 ═══════════════════════════════════ */
 const BOT_TOKEN  = process.env.BOT_TOKEN  || '8645097113:AAHhYO7AFy6dWLZVqVIUXicy5yVoeVR4zWI';
 const SERVER_URL = process.env.SERVER_URL || 'https://kalypo-mods.onrender.com';
-const ADMIN_KEY  = process.env.ADMIN_KEY  || 'kalypo-admin-2024';
+const ADMIN_KEY = process.env.ADMIN_KEY || '990';
 const ADMIN_IDS  = (process.env.ADMIN_TELEGRAM_IDS || '7564594071').split(',').map(s => s.trim()).filter(Boolean);
 const PRICE_COINS = process.env.PRICE_COINS || '500';
 
