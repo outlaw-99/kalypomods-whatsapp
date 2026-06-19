@@ -42,6 +42,7 @@ function nextEmoji() {
    HELPERS
 ═══════════════════════════════════ */
 function isAdmin(msg) {
+  console.log('isAdmin check:', msg.from.id, ADMIN_IDS);
   return ADMIN_IDS.includes(String(msg.from.id)) || ADMIN_IDS.includes(String(msg.chat.id));
 }
 function resetSession(chatId) { delete sessions[chatId]; }
