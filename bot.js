@@ -1,4 +1,13 @@
 const TelegramBot = require('node-telegram-bot-api');
+const http = require('http');
+
+/* Render Web Services require listening on a port — this satisfies that
+   without affecting how the bot works (bot uses polling, not this server). */
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Kalypo Mods bot is running.');
+}).listen(PORT, () => console.log(`🌐 Health check listener on port ${PORT}`));
 
 /* ═══════════════════════════════════
    CONFIG
