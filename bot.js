@@ -1,215 +1,282 @@
-require('dotenv').config();
-const express  = require('express');
-const mongoose = require('mongoose');
-const qrcode   = require('qrcode');
-const axios    = require('axios');
-const { Client, RemoteAuth } = require('whatsapp-web.js');
-const { MongoStore } = require('wwebjs-mongo');
+const TelegramBot = require('node-telegram-bot-api');
 
-process.on('uncaughtException', err => console.error('💥 Uncaught exception:', err));
-process.on('unhandledRejection', err => console.error('💥 Unhandled rejection:', err));
+/* ═══════════════════════════════════
+   CONFIG
+═══════════════════════════════════ */
+const BOT_TOKEN  = process.env.BOT_TOKEN || '8645097113:AAHhYO7AFy6dWLZVqVIUXicy5yVoeVR4zWI';
+const SERVER_URL = process.env.SERVER_URL || 'https://kalypo-mods.onrender.com';
+const ADMIN_KEY   = process.env.ADMIN_KEY || 'kalypo-admin-2024';
+const ADMIN_IDS   = (process.env.ADMIN_TELEGRAM_IDS || '7564594071').split(',').map(s => s.trim()).filter(Boolean);
+const PRICE_GHS   = process.env.PRICE_GHS || '20';
 
-const PORT      = process.env.PORT || 3000;
-const API_BASE  = process.env.API_BASE_URL || 'http://localhost:3000';
-const MONGO_URI = process.env.MONGO_URI;
-// Digits only, with country code, no "+" — e.g. 233241234567. Leave unset to use QR instead.
-const PAIR_PHONE_NUMBER = process.env.PAIR_PHONE_NUMBER || null;
-
-if (!MONGO_URI) {
-  console.error('❌ MONGO_URI is not set.');
+if (!BOT_TOKEN || !SERVER_URL || !ADMIN_KEY) {
+  console.error('❌ Missing required env vars: BOT_TOKEN, SERVER_URL, ADMIN_KEY');
   process.exit(1);
 }
 
-const api = axios.create({ baseURL: API_BASE, timeout: 15000 });
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// In-memory per-chat session: WhatsApp chat ID -> { token, email, country }
-const sessions = new Map();
-function getSession(id) {
-  if (!sessions.has(id)) sessions.set(id, {});
-  return sessions.get(id);
+/* In-memory session state per chat (resets on bot restart — fine for this use case) */
+const sessions = {}; // chatId -> { step, data }
+
+function isAdmin(msg) {
+  return ADMIN_IDS.includes(String(msg.from.id)) || ADMIN_IDS.includes(String(msg.chat.id));
 }
 
-let latestQr   = null;
-let latestCode = null;
-let isReady    = false;
+function resetSession(chatId) {
+  delete sessions[chatId];
+}
 
-const HELP = `*Kalypo Mods Bot* — commands:
+/* ═══════════════════════════════════
+   SERVER API HELPERS
+═══════════════════════════════════ */
+async function apiCheck(ref) {
+  const r = await fetch(`${SERVER_URL}/api/check/${encodeURIComponent(ref)}`);
+  return r.json();
+}
 
-📋 *menu* — show this menu
-💰 *price* — show current price
-📝 *register <email> <password>* — create a wallet
-🔑 *login <email> <password>* — log in to your wallet
-👤 *balance* — check wallet balance & purchases
-💳 *deposit <paystackRef>* — credit a confirmed Paystack payment
-🛒 *buy <newEmail> <newPassword>* — buy an account using wallet balance
-🎫 *claim <ref> <newEmail> <newPassword>* — claim a specific ref code
-🔍 *check <ref>* — check if a ref code is valid/available
+async function apiClaim(ref, newEmail, newPassword) {
+  const r = await fetch(`${SERVER_URL}/api/claim`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ref, newEmail, newPassword })
+  });
+  return r.json();
+}
 
-_<newEmail>/<newPassword> = the login you want set on the purchased account._`;
+async function apiAdminAccounts() {
+  const r = await fetch(`${SERVER_URL}/api/admin/accounts`, {
+    headers: { 'x-admin-key': ADMIN_KEY }
+  });
+  return r.json();
+}
 
-async function start() {
-  await mongoose.connect(MONGO_URI);
-  console.log('✅ Mongo connected (used for WhatsApp session storage)');
+async function apiAdminStats() {
+  const r = await fetch(`${SERVER_URL}/api/admin/stats`, {
+    headers: { 'x-admin-key': ADMIN_KEY }
+  });
+  return r.json();
+}
 
-  const store = new MongoStore({ mongoose });
-  const clientOptions = {
-    authStrategy: new RemoteAuth({
-      store,
-      backupSyncIntervalMs: 5 * 60 * 1000
-    }),
-    puppeteer: {
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+async function apiAdminReset(ref) {
+  const r = await fetch(`${SERVER_URL}/api/admin/reset/${encodeURIComponent(ref)}`, {
+    method: 'POST',
+    headers: { 'x-admin-key': ADMIN_KEY }
+  });
+  return r.json();
+}
+
+/* ═══════════════════════════════════
+   CUSTOMER COMMANDS
+═══════════════════════════════════ */
+
+bot.onText(/^\/start$/, (msg) => {
+  const chatId = msg.chat.id;
+  resetSession(chatId);
+  bot.sendMessage(chatId,
+`🎮 *Welcome to Kalypo Mods*
+CPM2 Account Store
+
+Each account comes with:
+🪙 300 Coins  🚗 10–20 Cars  👑 King Rank
+🔓 All Cars  🎨 All Paintings  💡 Headlights
+👕 Clothes  🎬 Animations
+
+💰 Price: *GHS ${PRICE_GHS}* per account
+
+*How to order:*
+1️⃣ Pay the admin (ask for payment details with /pay)
+2️⃣ Wait for your ref code to be approved
+3️⃣ Use /claim to activate your account
+
+Commands:
+/pay — how to pay
+/check <ref> — check if a ref code is valid
+/claim — claim your account with a ref code
+/help — show this menu`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.onText(/^\/help$/, (msg) => bot.emit('text', { ...msg, text: '/start' }));
+
+bot.onText(/^\/pay$/, (msg) => {
+  bot.sendMessage(msg.chat.id,
+`💳 *How to Pay*
+
+Send *GHS ${PRICE_GHS}* via your preferred method, then send proof of payment to the admin in this chat.
+
+Once confirmed, the admin will approve you and you'll receive a ref code to claim your account with /claim.`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.onText(/^\/check (.+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const ref = match[1].trim().toUpperCase();
+  bot.sendMessage(chatId, '🔄 Checking...');
+  try {
+    const d = await apiCheck(ref);
+    if (d.ok) {
+      bot.sendMessage(chatId, `✅ *${ref}* is valid and available.\n\nUse /claim to activate it.`, { parse_mode: 'Markdown' });
+    } else {
+      bot.sendMessage(chatId, d.msg || '❌ Invalid ref code.');
     }
-  };
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Server error. Try again later.');
+  }
+});
 
-  if (PAIR_PHONE_NUMBER) {
-    clientOptions.pairWithPhoneNumber = {
-      phoneNumber: PAIR_PHONE_NUMBER,
-      showNotification: true
-    };
-    console.log(`🔢 Will request a pairing code for +${PAIR_PHONE_NUMBER} instead of a QR code.`);
+bot.onText(/^\/claim$/, (msg) => {
+  const chatId = msg.chat.id;
+  sessions[chatId] = { step: 'awaiting_ref', data: {} };
+  bot.sendMessage(chatId, '🎮 Send me your *ref code* (e.g. KAL-49TEX8):', { parse_mode: 'Markdown' });
+});
+
+/* ═══════════════════════════════════
+   ADMIN COMMANDS
+═══════════════════════════════════ */
+
+bot.onText(/^\/approve (.+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+
+  const targetUserId = match[1].trim();
+  bot.sendMessage(chatId, '🔄 Finding a free account...');
+
+  try {
+    const accs = await apiAdminAccounts();
+    if (accs.error) return bot.sendMessage(chatId, '❌ ' + accs.error);
+
+    const free = accs.find(a => a.status === 'AVAILABLE');
+    if (!free) return bot.sendMessage(chatId, '❌ No accounts available right now.');
+
+    bot.sendMessage(chatId, `✅ Assigned ref *${free.ref}* — send this to the customer:\n\n\`${free.ref}\``, { parse_mode: 'Markdown' });
+
+    // Try to DM the customer directly if their numeric Telegram ID was given
+    if (/^\d+$/.test(targetUserId)) {
+      bot.sendMessage(targetUserId,
+`✅ *Payment approved!*
+
+Your ref code: \`${free.ref}\`
+
+Use /claim in this bot to activate your CPM2 account.`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {
+        bot.sendMessage(chatId, '⚠️ Could not DM that user ID directly (they may not have started the bot). Send the ref manually.');
+      });
+    }
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Server error: ' + e.message);
+  }
+});
+
+bot.onText(/^\/stock$/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+
+  try {
+    const s = await apiAdminStats();
+    if (s.ok === false) return bot.sendMessage(chatId, '❌ ' + s.msg);
+    bot.sendMessage(chatId,
+`📊 *Kalypo Mods Stock*
+
+Total: ${s.total}
+✅ Available: ${s.available}
+🔴 Taken: ${s.taken}
+🟠 Invalid: ${s.invalid}
+🔵 Reserved: ${s.reserved}
+💳 Wallets: ${s.walletCount}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Server error.');
+  }
+});
+
+bot.onText(/^\/reset (.+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+
+  const ref = match[1].trim().toUpperCase();
+  bot.sendMessage(chatId, '🔄 Resetting...');
+  try {
+    const d = await apiAdminReset(ref);
+    bot.sendMessage(chatId, d.ok ? `✅ ${d.msg}` : `❌ ${d.msg}`);
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Server error.');
+  }
+});
+
+bot.onText(/^\/myid$/, (msg) => {
+  bot.sendMessage(msg.chat.id, `Your Telegram ID: \`${msg.from.id}\`\nChat ID: \`${msg.chat.id}\``, { parse_mode: 'Markdown' });
+});
+
+/* ═══════════════════════════════════
+   CONVERSATIONAL CLAIM FLOW
+═══════════════════════════════════ */
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+  const text = (msg.text || '').trim();
+  const session = sessions[chatId];
+
+  if (!session || text.startsWith('/')) return; // let command handlers deal with it
+
+  if (session.step === 'awaiting_ref') {
+    const ref = text.toUpperCase();
+    bot.sendMessage(chatId, '🔄 Verifying ref code...');
+    const d = await apiCheck(ref);
+    if (!d.ok) {
+      bot.sendMessage(chatId, (d.msg || '❌ Invalid ref code.') + '\n\nTry /claim again with a valid code.');
+      resetSession(chatId);
+      return;
+    }
+    session.data.ref = ref;
+    session.step = 'awaiting_email';
+    bot.sendMessage(chatId, '✅ Valid! Now send the *new email* you want for this CPM2 account:', { parse_mode: 'Markdown' });
+    return;
   }
 
-  const client = new Client(clientOptions);
-
-  client.on('qr', qr => {
-    if (!PAIR_PHONE_NUMBER) {
-      latestQr = qr;
-      isReady = false;
-      console.log('📷 New QR generated — open /qr in your browser to scan it.');
+  if (session.step === 'awaiting_email') {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(text)) {
+      bot.sendMessage(chatId, '⚠️ That doesn\'t look like a valid email. Try again:');
+      return;
     }
-  });
-  client.on('code', code => {
-    latestCode = code;
-    isReady = false;
-    console.log(`🔢 Pairing code: ${code} — open /qr in your browser to view it.`);
-  });
-  client.on('ready', () => {
-    isReady = true;
-    latestQr = null;
-    latestCode = null;
-    console.log('✅ WhatsApp bot is ready.');
-  });
-  client.on('auth_failure', m => console.error('❌ Auth failure:', m));
-  client.on('disconnected', r => { isReady = false; console.warn('⚠️ Disconnected:', r); });
-  client.on('remote_session_saved', () => console.log('💾 Session saved to Mongo — no rescan needed after redeploys.'));
+    session.data.email = text;
+    session.step = 'awaiting_password';
+    bot.sendMessage(chatId, '🔑 Now send the *new password* (min 6 characters):', { parse_mode: 'Markdown' });
+    return;
+  }
 
-  client.on('message', async msg => {
-    const text = (msg.body || '').trim();
-    if (!text) return;
-
-    const [cmdRaw, ...rest] = text.split(/\s+/);
-    const cmd = cmdRaw.toLowerCase();
-    const session = getSession(msg.from);
+  if (session.step === 'awaiting_password') {
+    if (text.length < 6) {
+      bot.sendMessage(chatId, '⚠️ Password must be at least 6 characters. Try again:');
+      return;
+    }
+    session.data.password = text;
+    bot.sendMessage(chatId, '🔄 Changing CPM2 credentials... this can take a few seconds.');
 
     try {
-      switch (cmd) {
-        case 'menu':
-        case 'help':
-          return msg.reply(HELP);
+      const d = await apiClaim(session.data.ref, session.data.email, session.data.password);
+      if (!d.ok) {
+        bot.sendMessage(chatId, `❌ ${d.msg || 'Something went wrong.'}`);
+      } else {
+        bot.sendMessage(chatId,
+`✅ *Account claimed!*
 
-        case 'price': {
-          const { data } = await api.get('/api/config');
-          return msg.reply(`💰 Price: GHS ${data.prices.GH}\nMinimum deposit: GHS ${data.minDep.GH}`);
-        }
+📧 Email: \`${session.data.email}\`
+🔑 Password: \`${session.data.password}\`
 
-        case 'register': {
-          const [email, password] = rest;
-          if (!email || !password) return msg.reply('Usage: register <email> <password>');
-          const { data } = await api.post('/api/wallet/register', { email, password, country: 'GH' });
-          if (!data.ok) return msg.reply(`❌ ${data.msg}`);
-          session.token = data.token; session.email = email; session.country = data.country;
-          return msg.reply(`✅ Wallet created for ${email}. Balance: GHS ${data.balance}`);
-        }
-
-        case 'login': {
-          const [email, password] = rest;
-          if (!email || !password) return msg.reply('Usage: login <email> <password>');
-          const { data } = await api.post('/api/wallet/login', { email, password });
-          if (!data.ok) return msg.reply(`❌ ${data.msg}`);
-          session.token = data.token; session.email = email; session.country = data.country;
-          return msg.reply(`✅ Logged in as ${email}. Balance: GHS ${data.balance}`);
-        }
-
-        case 'balance': {
-          if (!session.token) return msg.reply('You need to *login* or *register* first.');
-          const { data } = await api.get('/api/wallet/me', { headers: { 'x-wallet-token': session.token } });
-          if (!data.ok) return msg.reply(`❌ ${data.msg}`);
-          return msg.reply(`👤 ${data.email}\n💰 Balance: GHS ${data.balance}\n🛍 Purchases: ${data.purchases.length}`);
-        }
-
-        case 'deposit': {
-          if (!session.token) return msg.reply('You need to *login* first.');
-          const [reference] = rest;
-          if (!reference) return msg.reply('Usage: deposit <paystackReference>');
-          const { data } = await api.post('/api/wallet/deposit', { reference },
-            { headers: { 'x-wallet-token': session.token } });
-          if (!data.ok) return msg.reply(`❌ ${data.msg}`);
-          return msg.reply(`✅ Credited GHS ${data.credited}. New balance: GHS ${data.balance}`);
-        }
-
-        case 'buy': {
-          if (!session.token) return msg.reply('You need to *login* first.');
-          const [newEmail, newPassword] = rest;
-          if (!newEmail || !newPassword) return msg.reply('Usage: buy <newEmail> <newPassword>');
-          const { data } = await api.post('/api/wallet/buy', { newEmail, newPassword },
-            { headers: { 'x-wallet-token': session.token } });
-          if (!data.ok) return msg.reply(`❌ ${data.msg}`);
-          return msg.reply(`✅ Purchase complete! Ref: ${data.purchase.ref}\nNew balance: GHS ${data.balance}`);
-        }
-
-        case 'claim': {
-          const [ref, newEmail, newPassword] = rest;
-          if (!ref || !newEmail || !newPassword) return msg.reply('Usage: claim <ref> <newEmail> <newPassword>');
-          const { data } = await api.post('/api/claim', { ref, newEmail, newPassword });
-          if (!data.ok) return msg.reply(`❌ ${data.msg}`);
-          return msg.reply(`✅ Ref ${ref.toUpperCase()} claimed successfully!`);
-        }
-
-        case 'check': {
-          const [ref] = rest;
-          if (!ref) return msg.reply('Usage: check <ref>');
-          const { data } = await api.get(`/api/check/${ref}`);
-          if (!data.ok) return msg.reply(`❌ ${data.msg || 'Not available.'}`);
-          return msg.reply(`✅ Ref ${ref.toUpperCase()} is available.`);
-        }
-
-        default:
-          return msg.reply('Unknown command. Send *menu* to see what I can do.');
+Log into CPM2 with these credentials now. Save them somewhere safe!`,
+          { parse_mode: 'Markdown' }
+        );
       }
-    } catch (err) {
-      console.error(err);
-      return msg.reply('⚠️ Something went wrong talking to the server. Try again shortly.');
+    } catch(e) {
+      bot.sendMessage(chatId, '❌ Network error. Contact admin.');
     }
-  });
+    resetSession(chatId);
+    return;
+  }
+});
 
-  client.initialize();
-
-  // --- tiny web server: gives Render an open port, and lets you scan the QR from a browser ---
-  const app = express();
-
-  app.get('/', (req, res) => {
-    res.send(isReady ? '✅ WhatsApp bot is connected.' : '⏳ Not connected yet — visit /qr');
-  });
-
-  app.get('/qr', async (req, res) => {
-    if (isReady) return res.send('<h2>✅ Already connected — nothing to scan.</h2>');
-
-    if (latestCode) {
-      return res.send(`
-        <h2>Enter this code on your phone</h2>
-        <p>WhatsApp → Settings → Linked Devices → Link a Device → "Link with phone number instead"</p>
-        <h1 style="font-size:48px;letter-spacing:8px;font-family:monospace;">${latestCode}</h1>
-        <p><small>Codes expire after a few minutes — refresh this page to get a new one if it stops working.</small></p>
-      `);
-    }
-    if (!latestQr) return res.send('<h2>⏳ Generating code… refresh in a few seconds.</h2>');
-    const dataUrl = await qrcode.toDataURL(latestQr);
-    res.send(`<h2>Scan with WhatsApp → Linked Devices</h2><img src="${dataUrl}" />`);
-  });
-
-  app.listen(PORT, () => console.log(`🌐 Health server listening on port ${PORT}`));
-}
-
-start();
+console.log('🤖 Kalypo Mods Telegram bot is running...');
