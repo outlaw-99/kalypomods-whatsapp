@@ -1,17 +1,17 @@
 {
   "name": "kalypo-mods-telegram-bot",
   "version": "1.0.0",
-  "description": "Telegram bot for Kalypo Mods CPM2 account store",
+  "description": "Telegram bot for Ka",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
     "dev": "node --watch bot.js"
-    "mongoose": "^8.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "node-telegram-bot-api": "^0.66.0"
+    "node-telegram-bot-api": "^0.66.0",
+    "mongoose": "^8.0.0"
   }
 }
