@@ -335,20 +335,29 @@ _(e.g. KAL-49TEX8)_`,
 /* ═══════════════════════════════════
    CUSTOMER WALLET COMMANDS
 ═══════════════════════════════════ */
-bot.onText(/^\/wallet$/, async (msg) => {
+bot.onText(/^\/wallets$/, async (msg) => {
   const chatId = msg.chat.id;
-  const w = await getUserWallet(msg.from.id);
-  bot.sendMessage(chatId,
-`╔══════════════════╗
-  💰  *YOUR WALLET*  💰
-╚══════════════════╝
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
 
-🪙 Balance: *${w ? w.balance : 0} Coins*
-💵 Account Price: *${PRICE_COINS} Coins*
+  bot.sendMessage(chatId, '🔄 Loading wallets...');
+  try {
+    const wallets = await BotWallet.find().sort({ balance: -1 }).limit(50).catch(() => []);
+    if (!wallets.length) return bot.sendMessage(chatId, '📭 No wallets yet.');
 
-${w && w.balance >= PRICE_COINS ? '✅ You have enough to claim!' : '❌ Not enough coins. Contact admin to buy coins.'}`,
-    { parse_mode: 'Markdown' });
+    let text = `╔════════════════════╗\n  💰  *ALL USER WALLETS*\n╚════════════════════╝\n\n`;
+    text += `Total users: *${wallets.length}*\n\n`;
+    
+    wallets.forEach((w, i) => {
+      text += `${i + 1}. 👤 \`${w.userId}\`\n   💳 *${w.balance}* coins\n\n`;
+    });
+
+    bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Server error.');
+  }
 });
+
+
 
 /* ═══════════════════════════════════
    ADMIN WALLET COMMANDS
@@ -552,6 +561,7 @@ bot.onText(/^\/menu$/, (msg) => {
 ┌──────────────────────────┐
 │ 💰 /addcoins <id> <amt>    — add coins    │
 │ ➖ /removecoins <id> <amt> — remove coins │
+│ 💳 /wallets                 — all wallets    │
 │ 📋 /list                    — all accounts  │
 │ 🟡 /pending                — reserved      │
 │ 📊 /stock                  — stock status  │
