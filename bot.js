@@ -114,28 +114,6 @@ async function removeCoins(userId, amount) {
   ).catch(() => null);
 }
 
-async function getWallet(chatId) {
-  let w = await BotWallet.findOne({ chatId: String(chatId) }).catch(() => null);
-  if (!w) w = await BotWallet.create({ chatId: String(chatId), balance: 0, history: [] }).catch(() => null);
-  return w;
-}
-async function addCoins(chatId, amount, note) {
-  const w = await getWallet(chatId);
-  if (!w) return null;
-  w.balance = +(w.balance + amount).toFixed(2);
-  w.history.push({ type: 'credit', amount, note, at: new Date().toISOString() });
-  await w.save().catch(() => {});
-  return w;
-}
-async function deductCoins(chatId, amount, note) {
-  const w = await getWallet(chatId);
-  if (!w || w.balance < amount) return null;
-  w.balance = +(w.balance - amount).toFixed(2);
-  w.history.push({ type: 'debit', amount, note, at: new Date().toISOString() });
-  await w.save().catch(() => {});
-  return w;
-}
-
 function buildListPage(accounts, page) {
   const total = accounts.length;
   const totalPages = Math.ceil(total / PAGE_SIZE) || 1;
@@ -223,7 +201,16 @@ async function loadSchedules() {
 /* ═══════════════════════════════════
    AUTO REACT + USER TRACKING
 ═══════════════════════════════════ */
-bot.on('message', (msg) => {
+bot.on('message', async (msg) => {
+  // Check if user is banned
+  if (msg.chat.type === 'private') {
+    const banned = await isBanned(msg.from.id);
+    if (banned) {
+      bot.sendMessage(msg.chat.id, '🚫 You have been banned from using this bot.').catch(() => {});
+      return;
+    }
+  }
+  
   // Only save private chat users for broadcast
   if (msg.chat && msg.chat.type === 'private') saveUser(msg.chat.id);
   if (!msg.text) return;
@@ -756,6 +743,24 @@ bot.onText(/^\/schedules$/, (msg) => {
 });
 
 /* ═══════════════════════════════════
+   BAN SYSTEM
+═══════════════════════════════════ */
+const BannedSchema = new mongoose.Schema({ userId: { type: String, unique: true } });
+const Banned = mongoose.model('Banned', BannedSchema);
+
+async function isBanned(userId) {
+  return Banned.findOne({ userId: String(userId) }).catch(() => null);
+}
+
+async function banUser(userId) {
+  return Banned.create({ userId: String(userId) }).catch(() => null);
+}
+
+async function unbanUser(userId) {
+  return Banned.deleteOne({ userId: String(userId) }).catch(() => null);
+}
+
+/* ═══════════════════════════════════
    WELCOMER
 ═══════════════════════════════════ */
 bot.on('new_chat_members', (msg) => {
@@ -787,9 +792,79 @@ You just joined the #1 CPM2 account store 🔥
 😎 _Enjoy your stay!_`,
       { parse_mode: 'Markdown' }
     ).then(sent => {
-      setTimeout(() => bot.deleteMessage(chatId, sent.message_id).catch(() => {}), 30000);
+      setTimeout(() => bot.deleteMessage(chatId, sent.message_id).catch(() => {}), 60000);
     });
   });
+});
+
+/* ═══════════════════════════════════
+   LEAVER
+═══════════════════════════════════ */
+bot.on('left_chat_member', (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.left_chat_member.id;
+  const name = msg.left_chat_member.first_name || 'User';
+
+  // Message to group
+  bot.sendMessage(chatId,
+`👋 *${name}* has left the group.
+
+See you next time! 🎮`,
+    { parse_mode: 'Markdown' }
+  ).catch(() => {});
+
+  // DM to user
+  bot.sendMessage(userId,
+`╔═════════════════════╗
+  👋  *YOU LEFT KALYPO MODS*
+╚═════════════════════╝
+
+Hope to see you again soon! 🎮
+
+If you need anything, just come back and DM the bot.
+We'll be here! 💚`,
+    { parse_mode: 'Markdown' }
+  ).catch(() => {});
+});
+
+/* ═══════════════════════════════════
+   /ban COMMAND (admin)
+═══════════════════════════════════ */
+bot.onText(/^\/ban (\d+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+
+  const userId = match[1];
+  try {
+    await banUser(userId);
+    bot.sendMessage(chatId,
+`🚫 *User banned!*
+
+👤 User ID: \`${userId}\`
+🔒 Status: Banned from bot`,
+      { parse_mode: 'Markdown' });
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Error banning user.');
+  }
+});
+
+/* /unban COMMAND (admin) */
+bot.onText(/^\/unban (\d+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+
+  const userId = match[1];
+  try {
+    await unbanUser(userId);
+    bot.sendMessage(chatId,
+`✅ *User unbanned!*
+
+👤 User ID: \`${userId}\`
+🟢 Status: Unbanned`,
+      { parse_mode: 'Markdown' });
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Error unbanning user.');
+  }
 });
 
 /* ═══════════════════════════════════
