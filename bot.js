@@ -375,16 +375,20 @@ bot.onText(/^\/addcoins (\d+) (\d+)$/, async (msg, match) => {
 
   if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
 
-  const w = await addCoins(userId, amount);
-  if (!w) return bot.sendMessage(chatId, '❌ Error adding coins.');
+  try {
+    const w = await addCoins(userId, amount);
+    if (!w) return bot.sendMessage(chatId, '❌ Error adding coins to database.');
 
-  bot.sendMessage(chatId,
+    bot.sendMessage(chatId,
 `✅ *Coins added!*
 
 👤 User: \`${userId}\`
 ➕ Added: *${amount}* coins
 💰 New Balance: *${w.balance}* coins`,
-    { parse_mode: 'Markdown' });
+      { parse_mode: 'Markdown' });
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Error: ' + e.message);
+  }
 });
 
 bot.onText(/^\/removecoins (\d+) (\d+)$/, async (msg, match) => {
@@ -550,29 +554,33 @@ bot.onText(/^\/menu$/, (msg) => {
 ╚════════════════════╝
 
 👤 *CUSTOMER COMMANDS*
-┌──────────────────────┐
-│ 🏠 /start   — welcome screen    │
-│ 💳 /pay     — payment info       │
-│ 🔍 /check   — verify ref code   │
-│ 🎮 /claim   — activate account  │
-│ 📟 /menu    — show this menu    │
-└──────────────────────┘${admin ? `
+┌──────────────────────────┐
+│ 🏠 /start      — welcome screen        │
+│ 💳 /pay        — payment info           │
+│ 🪙 /wallet     — check coin balance    │
+│ 🔑 /buyref     — buy ref code          │
+│ 🎮 /claim      — activate account      │
+│ 📟 /menu       — show this menu        │
+│ 🪪 /myid       — your Telegram ID      │
+└──────────────────────────┘${admin ? `
 
 🔐 *ADMIN COMMANDS*
-┌──────────────────────┐
-│ 📋 /list                — all accounts        │
-│ 🟡 /pending          — reserved only       │
-│ 📊 /stock             — stock summary      │
-│ ✅ /approve <id>   — approve payment   │
-│ 🔄 /reset <ref>     — reset account       │
-│ 📢 /broadcast       — DM all users        │
-│ 📅 /schedule        — set daily message  │
-│ 🗑 /unschedule     — cancel schedule     │
-│ 📋 /schedules       — list schedules      │
-│ 🪪 /myid             — your Telegram ID   │
-└──────────────────────┘
+┌──────────────────────────┐
+│ 💰 /addcoins <id> <amt>    — add coins    │
+│ ➖ /removecoins <id> <amt> — remove coins │
+│ 📋 /list                    — all accounts  │
+│ 🟡 /pending                — reserved      │
+│ 📊 /stock                  — stock status  │
+│ ✅ /approve <id>          — give ref      │
+│ 🔄 /reset <ref>           — reset account │
+│ 📢 /broadcast <msg>       — DM all users  │
+│ 📅 /schedule <time> <msg> — daily msg     │
+│ 🗑️ /unschedule <time>     — cancel        │
+│ 📋 /schedules             — list active   │
+└──────────────────────────┘
 
-👥 *Users tracked:* ${knownUsers.size}` : ''}`,
+👥 *Users tracked:* ${knownUsers.size}
+🔐 *Admin:* ${admin ? 'Yes ✅' : 'No'}` : ''}`,
     { parse_mode: 'Markdown' }
   );
 });
