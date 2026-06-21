@@ -87,31 +87,50 @@ function statusEmoji(s) {
 
 async function saveUser(chatId) {
   knownUsers.add(chatId);
-  await BotUser.updateOne({ chatId: String(chatId) }, { chatId: String(chatId) }, { upsert: true }).catch(() => {});
+  try {
+    await BotUser.updateOne({ chatId: String(chatId) }, { chatId: String(chatId) }, { upsert: true });
+  } catch(e) {
+    console.error('Error saving user:', e.message);
+  }
 }
 
 async function getUserWallet(userId) {
-  let w = await BotWallet.findOne({ userId: String(userId) }).catch(() => null);
-  if (!w) w = await BotWallet.create({ userId: String(userId), balance: 0 }).catch(() => null);
-  return w;
+  try {
+    let w = await BotWallet.findOne({ userId: String(userId) });
+    if (!w) w = await BotWallet.create({ userId: String(userId), balance: 0 });
+    return w;
+  } catch(e) {
+    console.error('Error getting wallet:', e.message);
+    return null;
+  }
 }
 
 async function addCoins(userId, amount) {
-  return BotWallet.findOneAndUpdate(
-    { userId: String(userId) },
-    { $inc: { balance: amount } },
-    { upsert: true, new: true }
-  ).catch(() => null);
+  try {
+    return await BotWallet.findOneAndUpdate(
+      { userId: String(userId) },
+      { $inc: { balance: amount } },
+      { upsert: true, new: true }
+    );
+  } catch(e) {
+    console.error('Error adding coins:', e.message);
+    return null;
+  }
 }
 
 async function removeCoins(userId, amount) {
-  const w = await BotWallet.findOne({ userId: String(userId) }).catch(() => null);
-  if (!w || w.balance < amount) return null;
-  return BotWallet.findOneAndUpdate(
-    { userId: String(userId) },
-    { $inc: { balance: -amount } },
-    { new: true }
-  ).catch(() => null);
+  try {
+    const w = await BotWallet.findOne({ userId: String(userId) });
+    if (!w || w.balance < amount) return null;
+    return await BotWallet.findOneAndUpdate(
+      { userId: String(userId) },
+      { $inc: { balance: -amount } },
+      { new: true }
+    );
+  } catch(e) {
+    console.error('Error removing coins:', e.message);
+    return null;
+  }
 }
 
 function buildListPage(accounts, page) {
