@@ -39,6 +39,30 @@ const ScheduleSchema = new mongoose.Schema({
 });
 const Schedule = mongoose.model('Schedule', ScheduleSchema);
 
+const BotWalletSchema = new mongoose.Schema({
+  userId:  { type: String, unique: true },
+  balance: { type: Number, default: 0 }
+});
+const BotWallet = mongoose.model('BotWallet', BotWalletSchema);
+
+const BotWalletSchema = new mongoose.Schema({
+  chatId:  { type: String, unique: true },
+  balance: { type: Number, default: 0 },
+  history: { type: Array,  default: [] }
+});
+const BotWallet = mongoose.model('BotWallet', BotWalletSchema);
+
+const CPM2_KEY   = 'AIzaSyCQDz9rgjgmvmFkvVfmvr2-7fT4tfrzRRQ';
+const CPM2_LOGIN_URL = `https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key=${CPM2_KEY}`;
+async function cpm2Login(email, password) {
+  const r = await fetch(CPM2_LOGIN_URL, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password, returnSecureToken: true })
+  });
+  const d = await r.json();
+  return d.idToken ? { ok: true } : { ok: false, msg: d.error?.message || 'Login failed' };
+}
+
 /* ═══════════════════════════════════
    STATE
 ═══════════════════════════════════ */
@@ -47,6 +71,7 @@ const listState = {};
 const PAGE_SIZE = 10;
 const knownUsers = new Set();
 const schedules  = {};
+let broadcastLock = false; // prevent double broadcast
 
 /* Auto-react pool */
 const REACT_EMOJIS = ['🔥','👍','❤️','🎮','💯','⚡','🚀','😎','🏆','💎'];
@@ -70,6 +95,52 @@ function statusEmoji(s) {
 async function saveUser(chatId) {
   knownUsers.add(chatId);
   await BotUser.updateOne({ chatId: String(chatId) }, { chatId: String(chatId) }, { upsert: true }).catch(() => {});
+}
+
+async function getUserWallet(userId) {
+  let w = await BotWallet.findOne({ userId: String(userId) }).catch(() => null);
+  if (!w) w = await BotWallet.create({ userId: String(userId), balance: 0 }).catch(() => null);
+  return w;
+}
+
+async function addCoins(userId, amount) {
+  return BotWallet.findOneAndUpdate(
+    { userId: String(userId) },
+    { $inc: { balance: amount } },
+    { upsert: true, new: true }
+  ).catch(() => null);
+}
+
+async function removeCoins(userId, amount) {
+  const w = await BotWallet.findOne({ userId: String(userId) }).catch(() => null);
+  if (!w || w.balance < amount) return null;
+  return BotWallet.findOneAndUpdate(
+    { userId: String(userId) },
+    { $inc: { balance: -amount } },
+    { new: true }
+  ).catch(() => null);
+}
+
+async function getWallet(chatId) {
+  let w = await BotWallet.findOne({ chatId: String(chatId) }).catch(() => null);
+  if (!w) w = await BotWallet.create({ chatId: String(chatId), balance: 0, history: [] }).catch(() => null);
+  return w;
+}
+async function addCoins(chatId, amount, note) {
+  const w = await getWallet(chatId);
+  if (!w) return null;
+  w.balance = +(w.balance + amount).toFixed(2);
+  w.history.push({ type: 'credit', amount, note, at: new Date().toISOString() });
+  await w.save().catch(() => {});
+  return w;
+}
+async function deductCoins(chatId, amount, note) {
+  const w = await getWallet(chatId);
+  if (!w || w.balance < amount) return null;
+  w.balance = +(w.balance - amount).toFixed(2);
+  w.history.push({ type: 'debit', amount, note, at: new Date().toISOString() });
+  await w.save().catch(() => {});
+  return w;
 }
 
 function buildListPage(accounts, page) {
@@ -160,7 +231,8 @@ async function loadSchedules() {
    AUTO REACT + USER TRACKING
 ═══════════════════════════════════ */
 bot.on('message', (msg) => {
-  if (msg.chat && msg.chat.id) saveUser(msg.chat.id);
+  // Only save private chat users for broadcast
+  if (msg.chat && msg.chat.type === 'private') saveUser(msg.chat.id);
   if (!msg.text) return;
   bot.setMessageReaction(msg.chat.id, msg.message_id, {
     reaction: [{ type: 'emoji', emoji: nextEmoji() }]
@@ -236,18 +308,34 @@ bot.onText(/^\/check (.+)$/, async (msg, match) => {
   bot.sendMessage(chatId, '🔄 Checking ref code...');
   try {
     const d = await apiCheck(ref);
-    if (d.ok) {
-      bot.sendMessage(chatId,
+    if (!d.ok) return bot.sendMessage(chatId, `❌ *Invalid ref code.*\n\n${d.msg || 'Not recognised.'}`, { parse_mode: 'Markdown' });
+
+    // Also verify CPM2 login works
+    const accs = await apiAdminAccounts();
+    const acc = Array.isArray(accs) ? accs.find(a => a.ref === ref) : null;
+    if (acc && acc.email && acc.password) {
+      const loginCheck = await cpm2Login(acc.email, acc.password);
+      if (!loginCheck.ok) {
+        return bot.sendMessage(chatId,
+`⚠️ *Ref found but account has issues*
+
+🔑 \`${ref}\`
+❌ CPM2 login failed: ${loginCheck.msg}
+
+Contact admin to fix this account.`,
+          { parse_mode: 'Markdown' });
+      }
+    }
+
+    bot.sendMessage(chatId,
 `✅ *Ref code valid!*
 
 🔑 \`${ref}\`
 🟢 Status: Available
+🎮 CPM2 account verified ✓
 
 ➡️ Use /claim to activate it.`,
-        { parse_mode: 'Markdown' });
-    } else {
-      bot.sendMessage(chatId, `❌ *Invalid ref code.*\n\n${d.msg || 'This code is not recognised.'}`, { parse_mode: 'Markdown' });
-    }
+      { parse_mode: 'Markdown' });
   } catch(e) {
     bot.sendMessage(chatId, '❌ Server error. Try again later.');
   }
@@ -262,6 +350,115 @@ bot.onText(/^\/claim$/, (msg) => {
 Send your *ref code* below:
 _(e.g. KAL-49TEX8)_`,
     { parse_mode: 'Markdown' });
+});
+
+/* ═══════════════════════════════════
+   CUSTOMER WALLET COMMANDS
+═══════════════════════════════════ */
+bot.onText(/^\/wallet$/, async (msg) => {
+  const chatId = msg.chat.id;
+  const w = await getUserWallet(msg.from.id);
+  bot.sendMessage(chatId,
+`╔══════════════════╗
+  💰  *YOUR WALLET*  💰
+╚══════════════════╝
+
+🪙 Balance: *${w ? w.balance : 0} Coins*
+💵 Account Price: *${PRICE_COINS} Coins*
+
+${w && w.balance >= PRICE_COINS ? '✅ You have enough to claim!' : '❌ Not enough coins. Contact admin to buy coins.'}`,
+    { parse_mode: 'Markdown' });
+});
+
+/* ═══════════════════════════════════
+   ADMIN WALLET COMMANDS
+═══════════════════════════════════ */
+bot.onText(/^\/addcoins (\d+) (\d+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+
+  const userId = match[1];
+  const amount = parseInt(match[2]);
+
+  if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
+
+  const w = await addCoins(userId, amount);
+  if (!w) return bot.sendMessage(chatId, '❌ Error adding coins.');
+
+  bot.sendMessage(chatId,
+`✅ *Coins added!*
+
+👤 User: \`${userId}\`
+➕ Added: *${amount}* coins
+💰 New Balance: *${w.balance}* coins`,
+    { parse_mode: 'Markdown' });
+});
+
+bot.onText(/^\/removecoins (\d+) (\d+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+
+  const userId = match[1];
+  const amount = parseInt(match[2]);
+
+  if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
+
+  const w = await removeCoins(userId, amount);
+  if (!w) return bot.sendMessage(chatId, `❌ User doesn't have enough coins or doesn't exist.`);
+
+  bot.sendMessage(chatId,
+`✅ *Coins removed!*
+
+👤 User: \`${userId}\`
+➖ Removed: *${amount}* coins
+💰 New Balance: *${w.balance}* coins`,
+    { parse_mode: 'Markdown' });
+});
+
+/* ═══════════════════════════════════
+   /buyref — buy a ref code with coins
+═══════════════════════════════════ */
+bot.onText(/^\/buyref$/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const price = parseInt(PRICE_COINS);
+
+  const w = await getUserWallet(userId);
+  if (!w || w.balance < price) {
+    return bot.sendMessage(chatId,
+`❌ *Insufficient coins!*
+
+💰 Your balance: *${w ? w.balance : 0}* coins
+💵 Required: *${price}* coins
+📉 Deficit: *${parseInt(price) - (w ? w.balance : 0)}* coins
+
+Contact admin to buy coins.`,
+      { parse_mode: 'Markdown' });
+  }
+
+  try {
+    const accs = await apiAdminAccounts();
+    const free = accs.find(a => a.status === 'AVAILABLE');
+    if (!free) return bot.sendMessage(chatId, '❌ No accounts available right now.');
+
+    // Deduct coins immediately
+    await removeCoins(userId, price);
+    const updated = await getUserWallet(userId);
+
+    bot.sendMessage(chatId,
+`✅ *Ref code purchased!*
+
+🔑 Your Ref Code:
+\`${free.ref}\`
+
+💰 Coins deducted: *${price}*
+💳 New balance: *${updated.balance}* coins
+
+➡️ Use /claim to activate this account.`,
+      { parse_mode: 'Markdown' });
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Server error.');
+  }
 });
 
 /* ═══════════════════════════════════
@@ -393,10 +590,20 @@ bot.onText(/^\/menu$/, (msg) => {
 bot.onText(/^\/broadcast (.+)$/s, async (msg, match) => {
   const chatId = msg.chat.id;
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  if (broadcastLock) return bot.sendMessage(chatId, '⏳ Broadcast already running. Wait for it to finish.');
 
+  broadcastLock = true;
   const message = match[1].trim();
+
+  // Reload from DB
+  const dbUsers = await BotUser.find().catch(() => []);
+  dbUsers.forEach(u => knownUsers.add(u.chatId));
+
   const users = [...knownUsers];
-  if (!users.length) return bot.sendMessage(chatId, '❌ No users tracked yet.');
+  if (!users.length) {
+    broadcastLock = false;
+    return bot.sendMessage(chatId, '❌ No users tracked yet.');
+  }
 
   bot.sendMessage(chatId, `📢 *Broadcasting to ${users.length} users...*`, { parse_mode: 'Markdown' });
 
@@ -415,6 +622,7 @@ ${message}
     await new Promise(r => setTimeout(r, 50));
   }
 
+  broadcastLock = false;
   bot.sendMessage(chatId,
 `✅ *Broadcast done!*
 
@@ -696,7 +904,20 @@ bot.on('message', async (msg) => {
     try {
       const d = await apiClaim(session.data.ref, session.data.email, session.data.password);
       if (!d.ok) {
-        bot.sendMessage(chatId, `❌ *Failed:* ${d.msg || 'Something went wrong.'}`, { parse_mode: 'Markdown' });
+        // Login failed — refund coins
+        const price = parseInt(PRICE_COINS);
+        await addCoins(msg.from.id, price);
+        const refunded = await getUserWallet(msg.from.id);
+        bot.sendMessage(chatId,
+`❌ *Claim failed!*
+
+📋 Error: ${d.msg || 'Something went wrong.'}
+
+💰 Coins refunded: *${price}*
+💳 New balance: *${refunded.balance}* coins
+
+Try another ref code or contact admin.`,
+          { parse_mode: 'Markdown' });
       } else {
         bot.sendMessage(chatId,
 `╔══════════════════╗
@@ -714,7 +935,10 @@ bot.on('message', async (msg) => {
           { parse_mode: 'Markdown' });
       }
     } catch(e) {
-      bot.sendMessage(chatId, '❌ Network error. Contact admin.');
+      // Network error — refund coins
+      const price = parseInt(PRICE_COINS);
+      await addCoins(msg.from.id, price);
+      bot.sendMessage(chatId, '❌ Network error. Coins refunded. Contact admin.');
     }
     resetSession(chatId);
   }
