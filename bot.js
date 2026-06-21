@@ -425,18 +425,15 @@ Contact admin to buy coins.`,
     const free = accs.find(a => a.status === 'AVAILABLE');
     if (!free) return bot.sendMessage(chatId, '❌ No accounts available right now.');
 
-    // Deduct coins immediately
-    await removeCoins(userId, price);
-    const updated = await getUserWallet(userId);
-
+    // Just show the ref — coins will be deducted on successful claim
     bot.sendMessage(chatId,
-`✅ *Ref code purchased!*
+`✅ *Ref code generated!*
 
 🔑 Your Ref Code:
 \`${free.ref}\`
 
-💰 Coins deducted: *${price}*
-💳 New balance: *${updated.balance}* coins
+💰 Price: *${price}* coins
+⏳ Coins will be deducted when you successfully claim.
 
 ➡️ Use /claim to activate this account.`,
       { parse_mode: 'Markdown' });
@@ -995,6 +992,11 @@ bot.on('message', async (msg) => {
 Try another ref code or contact admin.`,
           { parse_mode: 'Markdown' });
       } else {
+        // Claim successful — deduct coins NOW
+        const price = parseInt(PRICE_COINS);
+        await removeCoins(msg.from.id, price);
+        const updated = await getUserWallet(msg.from.id);
+        
         bot.sendMessage(chatId,
 `╔══════════════════╗
   🎉  *ACCOUNT CLAIMED!*
@@ -1005,6 +1007,9 @@ Try another ref code or contact admin.`,
 
 🔑 Password:
 \`${session.data.password}\`
+
+💰 Coins deducted: *${price}*
+💳 Remaining balance: *${updated.balance}* coins
 
 🎮 Log into CPM2 now and enjoy!
 💾 _Save these credentials safely._`,
