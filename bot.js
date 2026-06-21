@@ -218,7 +218,7 @@ async function loadSchedules() {
 }
 
 /* ═══════════════════════════════════
-   AUTO REACT + USER TRACKING
+   AUTO REACT + USER TRACKING (disabled for stability)
 ═══════════════════════════════════ */
 bot.on('message', async (msg) => {
   // Check if user is banned
@@ -233,9 +233,11 @@ bot.on('message', async (msg) => {
   // Only save private chat users for broadcast
   if (msg.chat && msg.chat.type === 'private') saveUser(msg.chat.id);
   if (!msg.text) return;
-  bot.setMessageReaction(msg.chat.id, msg.message_id, {
-    reaction: [{ type: 'emoji', emoji: nextEmoji() }]
-  }).catch(() => {});
+  
+  // Auto-react disabled to reduce queue load
+  // bot.setMessageReaction(msg.chat.id, msg.message_id, {
+  //   reaction: [{ type: 'emoji', emoji: nextEmoji() }]
+  // }).catch(() => {});
 });
 
 /* ═══════════════════════════════════
