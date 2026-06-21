@@ -77,7 +77,7 @@ function nextEmoji() {
    HELPERS
 ═══════════════════════════════════ */
 function isAdmin(msg) {
-  return ADMIN_IDS.includes(String(msg.from.id)) || ADMIN_IDS.includes(String(msg.chat.id));
+  return ADMIN_IDS.includes(String(msg.from.id));
 }
 function resetSession(chatId) { delete sessions[chatId]; }
 
@@ -372,6 +372,14 @@ bot.onText(/^\/addcoins (\d+) (\d+)$/, async (msg, match) => {
   if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
 
   try {
+    // Log the command
+    await CommandLog.create({
+      userId: String(msg.from.id),
+      username: msg.from.username || msg.from.first_name || 'Unknown',
+      command: 'addcoins',
+      params: { targetUserId: userId, amount }
+    }).catch(() => {});
+
     const w = await addCoins(userId, amount);
     if (!w) return bot.sendMessage(chatId, '❌ Error adding coins to database.');
 
@@ -752,8 +760,14 @@ bot.onText(/^\/schedules$/, (msg) => {
 /* ═══════════════════════════════════
    BAN SYSTEM
 ═══════════════════════════════════ */
-const BannedSchema = new mongoose.Schema({ userId: { type: String, unique: true } });
-const Banned = mongoose.model('Banned', BannedSchema);
+const CommandLogSchema = new mongoose.Schema({
+  userId: String,
+  username: String,
+  command: String,
+  params: mongoose.Schema.Types.Mixed,
+  timestamp: { type: Date, default: Date.now }
+});
+const CommandLog = mongoose.model('CommandLog', CommandLogSchema);
 
 async function isBanned(userId) {
   return Banned.findOne({ userId: String(userId) }).catch(() => null);
@@ -832,6 +846,33 @@ If you need anything, just come back and DM the bot.
 We'll be here! 💚`,
     { parse_mode: 'Markdown' }
   ).catch(() => {});
+});
+
+/* ═══════════════════════════════════
+   /cmdlog COMMAND (admin)
+═══════════════════════════════════ */
+bot.onText(/^\/cmdlog$/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+
+  try {
+    const logs = await CommandLog.find().sort({ timestamp: -1 }).limit(20).catch(() => []);
+    if (!logs.length) return bot.sendMessage(chatId, '📭 No command logs yet.');
+
+    let text = `╔════════════════════╗\n  📋  *COMMAND LOG*\n╚════════════════════╝\n\n`;
+    
+    logs.forEach((log, i) => {
+      const time = new Date(log.timestamp).toLocaleString();
+      text += `${i + 1}. *${log.command}*\n`;
+      text += `   👤 \`${log.username}\` (${log.userId})\n`;
+      text += `   🕐 ${time}\n`;
+      text += `   📝 Params: ${JSON.stringify(log.params)}\n\n`;
+    });
+
+    bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Error loading logs.');
+  }
 });
 
 /* ═══════════════════════════════════
