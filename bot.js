@@ -21,7 +21,13 @@ const MONGO_URI   = process.env.MONGODB_URI || 'mongodb+srv://rm1402678_db_user:
 const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || '-1003787424518';
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-bot.setMaxListeners(0); // Unlimited listeners
+// Increase listener limit for stability
+process.setMaxListeners(0);
+bot._events && Object.keys(bot._events).forEach(event => {
+  if (bot.listeners(event).length > 10) {
+    bot.setMaxListeners(50);
+  }
+});
 
 /* ═══════════════════════════════════
    MONGODB MODELS
