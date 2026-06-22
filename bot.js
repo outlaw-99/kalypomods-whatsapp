@@ -52,6 +52,9 @@ const BotWalletSchema = new mongoose.Schema({
 });
 const BotWallet = mongoose.model('BotWallet', BotWalletSchema);
 
+const BannedSchema = new mongoose.Schema({ userId: { type: String, unique: true } });
+const Banned = mongoose.model('Banned', BannedSchema);
+
 const CPM2_KEY   = 'AIzaSyCQDz9rgjgmvmFkvVfmvr2-7fT4tfrzRRQ';
 const CPM2_LOGIN_URL = `https://www.googleapis.com/identitytoolkit/v3/relyingparty/verifyPassword?key=${CPM2_KEY}`;
 async function cpm2Login(email, password) {
