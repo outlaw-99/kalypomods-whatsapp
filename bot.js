@@ -18,7 +18,6 @@ const ADMIN_KEY   = process.env.ADMIN_KEY  || '990';
 const ADMIN_IDS   = (process.env.ADMIN_TELEGRAM_IDS || '7564594071').split(',').map(s => s.trim()).filter(Boolean);
 const PRICE_COINS = process.env.PRICE_COINS || '500';
 const MONGO_URI   = process.env.MONGODB_URI || 'mongodb+srv://rm1402678_db_user:52q7DBT4rJAE786p@cluster0.t0auzso.mongodb.net/kalypo?appName=Cluster0';
-const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || '-1003787424518';
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 // Increase listener limit for stability
