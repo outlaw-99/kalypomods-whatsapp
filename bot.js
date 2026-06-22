@@ -21,6 +21,7 @@ const MONGO_URI   = process.env.MONGODB_URI || 'mongodb+srv://rm1402678_db_user:
 const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || '-1003787424518';
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+bot.setMaxListeners(0); // Unlimited listeners
 
 /* ═══════════════════════════════════
    MONGODB MODELS
@@ -217,34 +218,24 @@ async function loadSchedules() {
   if (all.length) console.log(`📅 Loaded ${all.length} schedule(s) from DB`);
 }
 
-/* ═══════════════════════════════════
-   AUTO REACT + USER TRACKING (disabled for stability)
-═══════════════════════════════════ */
-bot.on('message', async (msg) => {
-  // Check if user is banned
-  if (msg.chat.type === 'private') {
-    const banned = await isBanned(msg.from.id);
-    if (banned) {
-      bot.sendMessage(msg.chat.id, '🚫 You have been banned from using this bot.').catch(() => {});
-      return;
-    }
-  }
-  
-  // Only save private chat users for broadcast
-  if (msg.chat && msg.chat.type === 'private') saveUser(msg.chat.id);
-  if (!msg.text) return;
-  
-  // Auto-react disabled to reduce queue load
-  // bot.setMessageReaction(msg.chat.id, msg.message_id, {
-  //   reaction: [{ type: 'emoji', emoji: nextEmoji() }]
-  // }).catch(() => {});
-});
+/* Ban check happens in individual commands */
 
 /* ═══════════════════════════════════
    CUSTOMER COMMANDS
 ═══════════════════════════════════ */
-bot.onText(/^\/start$/, (msg) => {
+bot.onText(/^\/start$/, async (msg) => {
   const chatId = msg.chat.id;
+  
+  // Check if banned
+  if (msg.chat.type === 'private') {
+    const banned = await isBanned(msg.from.id);
+    if (banned) {
+      bot.sendMessage(chatId, '🚫 You have been banned from using this bot.');
+      return;
+    }
+    saveUser(msg.from.id);
+  }
+  
   resetSession(chatId);
   bot.sendMessage(chatId,
 `╔═══════════════════╗
