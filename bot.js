@@ -208,30 +208,55 @@ function buildListPage(accounts, page) {
    SERVER API
 ═══════════════════════════════════ */
 async function apiCheck(ref) {
-  const r = await fetch(`${SERVER_URL}/api/check/${encodeURIComponent(ref)}`);
-  return r.json();
+  try {
+    const r = await fetch(`${SERVER_URL}/api/check/${encodeURIComponent(ref)}`);
+    if (!r.ok) return { ok: false, msg: `Server returned ${r.status}` };
+    return r.json();
+  } catch(e) {
+    return { ok: false, msg: '🔌 Server is offline or starting up. Try again in 30s.' };
+  }
 }
 async function apiClaim(ref, newEmail, newPassword) {
-  const r = await fetch(`${SERVER_URL}/api/claim`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ref, newEmail, newPassword })
-  });
-  return r.json();
+  try {
+    const r = await fetch(`${SERVER_URL}/api/claim`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ref, newEmail, newPassword })
+    });
+    if (!r.ok) return { ok: false, msg: `Server returned ${r.status}` };
+    return r.json();
+  } catch(e) {
+    return { ok: false, msg: '🔌 Server is offline or starting up. Try again in 30s.' };
+  }
 }
 async function apiAdminAccounts() {
-  const r = await fetch(`${SERVER_URL}/api/admin/accounts`, { headers: { 'x-admin-key': ADMIN_KEY } });
-  return r.json();
+  try {
+    const r = await fetch(`${SERVER_URL}/api/admin/accounts`, { headers: { 'x-admin-key': ADMIN_KEY } });
+    if (!r.ok) throw new Error(`Status ${r.status}`);
+    return r.json();
+  } catch(e) {
+    throw new Error('🔌 Server offline: ' + e.message);
+  }
 }
 async function apiAdminStats() {
-  const r = await fetch(`${SERVER_URL}/api/admin/stats`, { headers: { 'x-admin-key': ADMIN_KEY } });
-  return r.json();
+  try {
+    const r = await fetch(`${SERVER_URL}/api/admin/stats`, { headers: { 'x-admin-key': ADMIN_KEY } });
+    if (!r.ok) throw new Error(`Status ${r.status}`);
+    return r.json();
+  } catch(e) {
+    throw new Error('🔌 Server offline: ' + e.message);
+  }
 }
 async function apiAdminReset(ref) {
-  const r = await fetch(`${SERVER_URL}/api/admin/reset/${encodeURIComponent(ref)}`, {
-    method: 'POST', headers: { 'x-admin-key': ADMIN_KEY }
-  });
-  return r.json();
+  try {
+    const r = await fetch(`${SERVER_URL}/api/admin/reset/${encodeURIComponent(ref)}`, {
+      method: 'POST', headers: { 'x-admin-key': ADMIN_KEY }
+    });
+    if (!r.ok) return { ok: false, msg: `Server returned ${r.status}` };
+    return r.json();
+  } catch(e) {
+    return { ok: false, msg: '🔌 Server offline: ' + e.message };
+  }
 }
 
 /* ═══════════════════════════════════
@@ -480,19 +505,38 @@ bot.onText(/^\/wallets$/, async (msg) => {
 /* ═══════════════════════════════════
    ADMIN WALLET COMMANDS
 ═══════════════════════════════════ */
-// /gc <userId> <amount> — silently credit coins (works in group, no visible reply)
-bot.onText(/^\/gc (\d+) (\d+)$/, async (msg, match) => {
-  const chatId = msg.chat.id;
+// /gc <amount>        — reply to someone's message to give them coins
+// /gc <userId> <amount> — explicit userId (works anywhere)
+bot.onText(/^\/gc(?: (\d+))? (\d+)$/, async (msg, match) => {
+  const chatId  = msg.chat.id;
   const inGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
 
-  // Always check against ADMIN_IDS list — not group membership
   if (!ADMIN_IDS.includes(String(msg.from.id))) {
-    // In group: stay silent so command looks like it did nothing
     if (!inGroup) bot.sendMessage(chatId, '🚫 Admin only.');
     return;
   }
 
-  const userId = match[1];
+  // Resolve target userId:
+  // - If replying to a message → use that user's ID
+  // - If first capture group present → use it as userId
+  // - Otherwise invalid
+  let userId, targetName;
+  if (msg.reply_to_message) {
+    const sender = msg.reply_to_message.from;
+    if (!sender || sender.is_bot) {
+      if (!inGroup) bot.sendMessage(chatId, '❌ Can\'t give coins to a bot.');
+      return;
+    }
+    userId     = String(sender.id);
+    targetName = sender.username ? `@${sender.username}` : sender.first_name;
+  } else if (match[1]) {
+    userId     = match[1];
+    targetName = `\`${userId}\``;
+  } else {
+    if (!inGroup) bot.sendMessage(chatId, '❌ Either reply to someone\'s message or use /gc <userId> <amount>');
+    return;
+  }
+
   const amount = parseInt(match[2]);
   if (amount <= 0) return;
 
@@ -510,13 +554,13 @@ bot.onText(/^\/gc (\d+) (\d+)$/, async (msg, match) => {
       return;
     }
 
-    // In group: delete the command message so nobody sees it, confirm via DM
     if (inGroup) {
       bot.deleteMessage(chatId, msg.message_id).catch(() => {});
       bot.sendMessage(msg.from.id,
 `✅ *Done (silent)*
 
-👤 User: \`${userId}\`
+👤 User: ${targetName}
+🆔 ID: \`${userId}\`
 ➕ Added: *${amount}* coins
 💰 New Balance: *${w.balance}* coins`,
         { parse_mode: 'Markdown' }).catch(() => {});
@@ -524,7 +568,8 @@ bot.onText(/^\/gc (\d+) (\d+)$/, async (msg, match) => {
       bot.sendMessage(chatId,
 `✅ *Coins added!*
 
-👤 User: \`${userId}\`
+👤 User: ${targetName}
+🆔 ID: \`${userId}\`
 ➕ Added: *${amount}* coins
 💰 New Balance: *${w.balance}* coins`,
         { parse_mode: 'Markdown' });
