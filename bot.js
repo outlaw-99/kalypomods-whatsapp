@@ -21,6 +21,16 @@ const MONGO_URI   = process.env.MONGODB_URI || 'mongodb+srv://rm1402678_db_user:
 const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || '-1003787424518';
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+/* Global ban gate — runs before every message/command */
+bot.on('message', async (msg) => {
+  if (!msg.from || msg.chat.type !== 'private') return;
+  const banned = await isBanned(msg.from.id);
+  if (banned) {
+    bot.sendMessage(msg.chat.id, '🚫 You are banned from using this bot.').catch(() => {});
+    throw new Error('BANNED'); // stops further listeners for this update
+  }
+});
 // Increase listener limit for stability
 process.setMaxListeners(0);
 bot._events && Object.keys(bot._events).forEach(event => {
@@ -47,8 +57,12 @@ const ScheduleSchema = new mongoose.Schema({
 const Schedule = mongoose.model('Schedule', ScheduleSchema);
 
 const BotWalletSchema = new mongoose.Schema({
-  userId:  { type: String, unique: true },
-  balance: { type: Number, default: 0 }
+  userId:      { type: String, unique: true },
+  username:    { type: String, default: '' },
+  displayName: { type: String, default: '' },
+  balance:     { type: Number, default: 0 },
+  totalEarned: { type: Number, default: 0 },  // lifetime coins received
+  claims:      { type: Number, default: 0 }   // successful claims
 });
 const BotWallet = mongoose.model('BotWallet', BotWalletSchema);
 
@@ -64,6 +78,32 @@ const CommandLogSchema = new mongoose.Schema({
 });
 const CommandLog = mongoose.model('CommandLog', CommandLogSchema);
 
+/* Activity log — every user action in one place */
+const ActivityLogSchema = new mongoose.Schema({
+  userId:   String,
+  username: String,
+  name:     String,
+  action:   String,          // e.g. '/start', 'claim_success', 'buyref_fail'
+  detail:   String,          // human-readable detail
+  result:   { type: String, enum: ['ok', 'fail', 'info'], default: 'info' },
+  timestamp:{ type: Date, default: Date.now }
+});
+const ActivityLog = mongoose.model('ActivityLog', ActivityLogSchema);
+
+/* Fire-and-forget logger */
+function log(msg, action, detail, result = 'info') {
+  const from = msg.from || {};
+  const username = from.username ? '@' + from.username : (from.first_name || 'Unknown');
+  ActivityLog.create({
+    userId:   String(from.id || '?'),
+    username,
+    name:     from.first_name || '',
+    action,
+    detail:   detail || '',
+    result
+  }).catch(() => {});
+}
+
 /* Reserved-ref tracking: userId → ref they paid for via /buyref */
 const PendingRefSchema = new mongoose.Schema({
   userId:    { type: String, unique: true },
@@ -72,16 +112,15 @@ const PendingRefSchema = new mongoose.Schema({
 });
 const PendingRef = mongoose.model('PendingRef', PendingRefSchema);
 
-/* Daily coin farm: tracks last claim time per user */
-const CoinFarmSchema = new mongoose.Schema({
-  userId:    { type: String, unique: true },
-  lastClaim: { type: Date, default: null }
+/* Persistent sessions - survive bot restarts */
+const SessionSchema = new mongoose.Schema({
+  chatId:    { type: String, unique: true },
+  step:      String,
+  data:      mongoose.Schema.Types.Mixed,
+  updatedAt: { type: Date, default: Date.now, expires: 3600 }
 });
-const CoinFarm = mongoose.model('CoinFarm', CoinFarmSchema);
+const SessionStore = mongoose.model('SessionStore', SessionSchema);
 
-/* Farm config */
-const FARM_COINS        = parseInt(process.env.FARM_COINS        || '50');   // coins per claim
-const FARM_COOLDOWN_HRS = parseInt(process.env.FARM_COOLDOWN_HRS || '24');   // hours between claims
 
 async function isBanned(userId) {
   return Banned.findOne({ userId: String(userId) }).catch(() => null);
@@ -129,7 +168,19 @@ function nextEmoji() {
 function isAdmin(msg) {
   return ADMIN_IDS.includes(String(msg.from.id));
 }
-function resetSession(chatId) { delete sessions[chatId]; }
+async function resetSession(chatId) {
+  delete sessions[chatId];
+  await SessionStore.deleteOne({ chatId: String(chatId) }).catch(() => {});
+}
+
+async function saveSession(chatId, session) {
+  sessions[chatId] = session;
+  await SessionStore.findOneAndUpdate(
+    { chatId: String(chatId) },
+    { chatId: String(chatId), step: session.step, data: session.data, updatedAt: new Date() },
+    { upsert: true }
+  ).catch(() => {});
+}
 
 function statusEmoji(s) {
   return { AVAILABLE: '🟢', TAKEN: '🔴', RESERVED: '🟡', INVALID: '⛔' }[s] || '⚪';
@@ -155,11 +206,20 @@ async function getUserWallet(userId) {
   }
 }
 
-async function addCoins(userId, amount) {
+async function addCoins(userId, amount, from = null) {
   try {
+    const inc = { balance: amount };
+    if (amount > 0) inc.totalEarned = amount;
+    const update = { $inc: inc };
+    if (from) {
+      update.$set = {
+        username:    from.username ? '@' + from.username : '',
+        displayName: from.first_name || ''
+      };
+    }
     return await BotWallet.findOneAndUpdate(
       { userId: String(userId) },
-      { $inc: { balance: amount } },
+      update,
       { upsert: true, new: true }
     );
   } catch(e) {
@@ -309,7 +369,7 @@ bot.onText(/^\/start$/, async (msg) => {
     }
     saveUser(msg.from.id);
   }
-  
+  log(msg, '/start', '', 'info');
   resetSession(chatId);
   bot.sendMessage(chatId,
 `╔═══════════════════╗
@@ -349,6 +409,7 @@ bot.onText(/^\/start$/, async (msg) => {
 bot.onText(/^\/help$/, (msg) => bot.emit('text', { ...msg, text: '/start' }));
 
 bot.onText(/^\/pay$/, (msg) => {
+  log(msg, '/pay', '', 'info');
   bot.sendMessage(msg.chat.id,
 `╔══════════════════╗
    💳  *HOW TO PAY*  💳
@@ -374,31 +435,13 @@ bot.onText(/^\/check (.+)$/, async (msg, match) => {
   bot.sendMessage(chatId, '🔄 Checking ref code...');
   try {
     const d = await apiCheck(ref);
-    if (!d.ok) return bot.sendMessage(chatId, `❌ *Invalid ref code.*\n\n${d.msg || 'Not recognised.'}`, { parse_mode: 'Markdown' });
-
-    // Also verify CPM2 login works
-    const accs = await apiAdminAccounts();
-    const acc = Array.isArray(accs) ? accs.find(a => a.ref === ref) : null;
-    if (acc && acc.email && acc.password) {
-      const loginCheck = await cpm2Login(acc.email, acc.password);
-      if (!loginCheck.ok) {
-        return bot.sendMessage(chatId,
-`⚠️ *Ref found but account has issues*
-
-🔑 \`${ref}\`
-❌ CPM2 login failed: ${loginCheck.msg}
-
-Contact admin to fix this account.`,
-          { parse_mode: 'Markdown' });
-      }
-    }
-
+    if (!d.ok) { log(msg, '/check', `ref=${ref} INVALID`, 'fail'); return bot.sendMessage(chatId, `❌ *Invalid ref code.*\n\n${d.msg || 'Not recognised.'}`, { parse_mode: 'Markdown' }); }
+    log(msg, '/check', `ref=${ref} OK`, 'ok');
     bot.sendMessage(chatId,
 `✅ *Ref code valid!*
 
 🔑 \`${ref}\`
-🟢 Status: Available
-🎮 CPM2 account verified ✓
+🟢 Status: ${d.status || 'Available'}
 
 ➡️ Use /claim to activate it.`,
       { parse_mode: 'Markdown' });
@@ -411,6 +454,7 @@ bot.onText(/^\/claim$/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const price  = parseInt(PRICE_COINS);
+  log(msg, '/claim', 'started', 'info');
 
   // Check if user already has a pending ref from /buyref (coins already paid)
   const pending = await PendingRef.findOne({ userId: String(userId) }).catch(() => null);
@@ -430,7 +474,7 @@ Use /buyref to purchase a ref code, or contact admin.`,
     }
   }
 
-  sessions[chatId] = { step: 'awaiting_ref', data: { paidViaByuref: !!pending, pendingRef: pending?.ref } };
+  await saveSession(chatId, { step: 'awaiting_ref', data: { paidViaByuref: !!pending, pendingRef: pending?.ref } });
 
   if (pending) {
     // Pre-fill the ref they already paid for
@@ -444,6 +488,7 @@ _(Coins already paid via /buyref)_
       { parse_mode: 'Markdown' });
     sessions[chatId].step = 'awaiting_email';
     sessions[chatId].data.ref = pending.ref;
+    await saveSession(chatId, sessions[chatId]);
   } else {
     bot.sendMessage(chatId,
 `🎮 *Claim Your Account*
@@ -460,6 +505,7 @@ _(e.g. KAL-49TEX8)_`,
 bot.onText(/^\/wallet$/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
+  log(msg, '/wallet', '', 'info');
   const w = await getUserWallet(userId);
   const price = parseInt(PRICE_COINS);
   const balance = w ? w.balance : 0;
@@ -553,17 +599,42 @@ bot.onText(/^\/gc(?: (\d+))? (\d+)$/, async (msg, match) => {
       if (!inGroup) bot.sendMessage(chatId, '❌ Error updating balance.');
       return;
     }
+    // Save target's display name if we got it from reply
+    if (msg.reply_to_message?.from) {
+      const t = msg.reply_to_message.from;
+      await BotWallet.findOneAndUpdate(
+        { userId: String(userId) },
+        { $set: { username: t.username ? '@'+t.username : '', displayName: t.first_name||'' } }
+      ).catch(() => {});
+    }
 
     if (inGroup) {
+      // Delete the admin's command message
       bot.deleteMessage(chatId, msg.message_id).catch(() => {});
-      bot.sendMessage(msg.from.id,
+
+      // Try DM first, fall back to a self-destructing group reply only you can see
+      const confirmText =
 `✅ *Done (silent)*
 
 👤 User: ${targetName}
 🆔 ID: \`${userId}\`
 ➕ Added: *${amount}* coins
-💰 New Balance: *${w.balance}* coins`,
-        { parse_mode: 'Markdown' }).catch(() => {});
+💰 New Balance: *${w.balance}* coins`;
+
+      const dmSent = await bot.sendMessage(msg.from.id, confirmText, { parse_mode: 'Markdown' })
+        .then(() => true)
+        .catch(() => false);
+
+      if (!dmSent) {
+        // DM failed (haven't started bot in DM) — send in group, auto-delete after 6s
+        const tempMsg = await bot.sendMessage(chatId, confirmText, {
+          parse_mode: 'Markdown',
+          disable_notification: true
+        }).catch(() => null);
+        if (tempMsg) {
+          setTimeout(() => bot.deleteMessage(chatId, tempMsg.message_id).catch(() => {}), 6000);
+        }
+      }
     } else {
       bot.sendMessage(chatId,
 `✅ *Coins added!*
@@ -589,8 +660,8 @@ bot.onText(/^\/removecoins (\d+) (\d+)$/, async (msg, match) => {
   if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
 
   const w = await removeCoins(userId, amount);
-  if (!w) return bot.sendMessage(chatId, `❌ User doesn't have enough coins or doesn't exist.`);
-
+  if (!w) { log(msg, '/removecoins', `target=${userId} amount=${amount} FAIL`, 'fail'); return bot.sendMessage(chatId, `❌ User doesn't have enough coins or doesn't exist.`); }
+  log(msg, '/removecoins', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
   bot.sendMessage(chatId,
 `✅ *Coins removed!*
 
@@ -626,6 +697,7 @@ _If you need a new one, use /claim first or contact admin._`,
 
   const w = await getUserWallet(userId);
   if (!w || w.balance < price) {
+    log(msg, '/buyref', `insufficient coins bal=${w?w.balance:0}`, 'fail');
     return bot.sendMessage(chatId,
 `❌ *Insufficient coins!*
 
@@ -640,7 +712,7 @@ Contact admin to buy coins.`,
   try {
     const accs = await apiAdminAccounts();
     const free = accs.find(a => a.status === 'AVAILABLE');
-    if (!free) return bot.sendMessage(chatId, '❌ No accounts available right now. Try again soon.');
+    if (!free) { log(msg, '/buyref', 'no stock available', 'fail'); return bot.sendMessage(chatId, '❌ No accounts available right now. Try again soon.'); }
 
     // Deduct coins NOW before showing the ref
     const deducted = await removeCoins(userId, price);
@@ -653,6 +725,7 @@ Contact admin to buy coins.`,
       { upsert: true, new: true }
     ).catch(() => {});
 
+    log(msg, '/buyref', `ref=${free.ref} coins=${price}`, 'ok');
     bot.sendMessage(chatId,
 `✅ *Ref code purchased!*
 
@@ -678,6 +751,7 @@ bot.onText(/^\/approve (.+)$/, async (msg, match) => {
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
 
   const targetUserId = match[1].trim();
+  log(msg, '/approve', `target=${targetUserId}`, 'info');
   bot.sendMessage(chatId, '🔄 Finding a free account...');
   try {
     const accs = await apiAdminAccounts();
@@ -685,11 +759,19 @@ bot.onText(/^\/approve (.+)$/, async (msg, match) => {
     const free = accs.find(a => a.status === 'AVAILABLE');
     if (!free) return bot.sendMessage(chatId, '❌ No accounts available right now.');
 
+    // Reserve this ref for the target user so it can't be double-assigned
+    await PendingRef.findOneAndUpdate(
+      { userId: String(targetUserId) },
+      { userId: String(targetUserId), ref: free.ref },
+      { upsert: true }
+    ).catch(() => {});
+
     bot.sendMessage(chatId,
 `✅ *Approved!*
 
 🔑 Ref: \`${free.ref}\`
-Send this ref to the customer.`,
+👤 Reserved for: \`${targetUserId}\`
+_Ref is now locked to this user._`,
       { parse_mode: 'Markdown' });
 
     if (/^\d+$/.test(targetUserId)) {
@@ -715,6 +797,7 @@ Send this ref to the customer.`,
 bot.onText(/^\/stock$/, async (msg) => {
   const chatId = msg.chat.id;
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  log(msg, '/stock', '', 'info');
   try {
     const s = await apiAdminStats();
     if (s.ok === false) return bot.sendMessage(chatId, '❌ ' + s.msg);
@@ -742,6 +825,7 @@ bot.onText(/^\/reset (.+)$/, async (msg, match) => {
   bot.sendMessage(chatId, '🔄 Resetting...');
   try {
     const d = await apiAdminReset(ref);
+    log(msg, '/reset', `ref=${ref} result=${d.ok?'ok':'fail'}`, d.ok?'ok':'fail');
     bot.sendMessage(chatId, d.ok ? `✅ ${d.msg}` : `❌ ${d.msg}`);
   } catch(e) {
     bot.sendMessage(chatId, '❌ Server error.');
@@ -749,6 +833,7 @@ bot.onText(/^\/reset (.+)$/, async (msg, match) => {
 });
 
 bot.onText(/^\/myid$/, (msg) => {
+  log(msg, '/myid', '', 'info');
   bot.sendMessage(msg.chat.id,
 `🪪 *Your IDs*
 
@@ -760,6 +845,7 @@ bot.onText(/^\/myid$/, (msg) => {
 bot.onText(/^\/menu$/, (msg) => {
   const chatId = msg.chat.id;
   const admin = isAdmin(msg);
+  log(msg, '/menu', '', 'info');
   bot.sendMessage(chatId,
 `╔════════════════════╗
   📟  *KALYPO MODS MENU*  📟
@@ -774,6 +860,8 @@ bot.onText(/^\/menu$/, (msg) => {
 │ 🎮 /claim      — activate account      │
 │ 📟 /menu       — show this menu        │
 │ 🪪 /myid       — your Telegram ID      │
+│ 🏆 /top        — coin leaderboard      │
+│ 🏅 /rank       — your rank & stats     │
 └──────────────────────────┘${admin ? `
 
 🔐 *ADMIN COMMANDS*
@@ -789,6 +877,8 @@ bot.onText(/^\/menu$/, (msg) => {
 │ 📅 /schedule <time> <msg> — daily msg     │
 │ 🗑️ /unschedule <time>     — cancel        │
 │ 📋 /schedules             — list active   │
+│ 📊 /logs [n/fail/ok/id]  — activity log  │
+│ 📈 /logstats              — log summary   │
 └──────────────────────────┘
 
 👥 *Users tracked:* ${knownUsers.size}
@@ -818,6 +908,7 @@ bot.onText(/^\/broadcast (.+)$/s, async (msg, match) => {
     return bot.sendMessage(chatId, '❌ No users tracked yet.');
   }
 
+  log(msg, '/broadcast', `msg="${message.substring(0,60)}" users=${users.length}`, 'info');
   bot.sendMessage(chatId, `📢 *Broadcasting to ${users.length} users...*`, { parse_mode: 'Markdown' });
 
   let sent = 0, failed = 0;
@@ -850,6 +941,7 @@ ${message}
 bot.onText(/^\/list$/, async (msg) => {
   const chatId = msg.chat.id;
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  log(msg, '/list', '', 'info');
   bot.sendMessage(chatId, '🔄 Loading accounts...');
   try {
     const accs = await apiAdminAccounts();
@@ -1039,29 +1131,196 @@ We'll be here! 💚`,
 });
 
 /* ═══════════════════════════════════
-   /cmdlog COMMAND (admin)
+   LEADERBOARD COMMANDS
 ═══════════════════════════════════ */
-bot.onText(/^\/cmdlog$/, async (msg) => {
+const MEDALS = ['🥇','🥈','🥉','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
+
+// /top — public leaderboard (top coin holders)
+// /top claims — top claimers
+bot.onText(/^\/top(?: (coins|claims))?$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const mode = (match[1] || 'coins').toLowerCase();
+  log(msg, '/top', mode, 'info');
+
+  try {
+    const sortField = mode === 'claims' ? { claims: -1 } : { balance: -1 };
+    const top = await BotWallet.find().sort(sortField).limit(10).catch(() => []);
+
+    if (!top.length) return bot.sendMessage(chatId, '📭 No leaderboard data yet.');
+
+    const title = mode === 'claims' ? '🏆 TOP CLAIMERS' : '💰 TOP COIN HOLDERS';
+    let text = `╔════════════════════╗\n  ${title}\n╚════════════════════╝\n\n`;
+
+    top.forEach((w, i) => {
+      const medal  = MEDALS[i] || `${i+1}.`;
+      const name   = w.displayName || w.username || `User ${w.userId.slice(-4)}`;
+      const handle = w.username ? ` (${w.username})` : '';
+      const value  = mode === 'claims'
+        ? `*${w.claims || 0}* claims`
+        : `*${w.balance}* coins`;
+      text += `${medal} ${name}${handle}\n   ${value}\n\n`;
+    });
+
+    text += `_Updated live · /top claims for claim ranks_`;
+    bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Error loading leaderboard.');
+  }
+});
+
+// /rank — show your own rank
+bot.onText(/^\/rank$/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = String(msg.from.id);
+  log(msg, '/rank', '', 'info');
+
+  try {
+    const w = await getUserWallet(userId);
+    if (!w) return bot.sendMessage(chatId, '❌ No wallet found. Use /start first.');
+
+    // Count how many users have more coins / more claims
+    const coinsRank  = await BotWallet.countDocuments({ balance: { $gt: w.balance } }) + 1;
+    const claimsRank = await BotWallet.countDocuments({ claims:  { $gt: w.claims  } }) + 1;
+    const totalUsers = await BotWallet.countDocuments();
+
+    const tier = coinsRank === 1 ? '👑 Legend'
+               : coinsRank <= 3  ? '💎 Elite'
+               : coinsRank <= 10 ? '🔥 Top 10'
+               : coinsRank <= 25 ? '⭐ Rising'
+               :                   '🎮 Member';
+
+    bot.sendMessage(chatId,
+`╔══════════════════╗
+  🏅  *YOUR RANK*
+╚══════════════════╝
+
+👤 ${msg.from.first_name || 'You'}
+${tier}
+
+💰 Coins rank:  *#${coinsRank}* of ${totalUsers}
+🎮 Claim rank:  *#${claimsRank}* of ${totalUsers}
+
+💳 Balance:  *${w.balance}* coins
+🏆 Claims:   *${w.claims || 0}* accounts
+📈 All-time earned: *${w.totalEarned || 0}* coins
+
+➡️ /top to see full leaderboard`,
+      { parse_mode: 'Markdown' });
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Error fetching rank.');
+  }
+});
+
+/* ═══════════════════════════════════
+   /logs COMMAND (admin)
+═══════════════════════════════════ */
+// /logs          — last 20 entries
+// /logs 50       — last N entries
+// /logs fail     — only failures
+// /logs ok       — only successes
+// /logs <userId> — filter by user
+bot.onText(/^\/logs(?: (.+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
 
-  try {
-    const logs = await CommandLog.find().sort({ timestamp: -1 }).limit(20).catch(() => []);
-    if (!logs.length) return bot.sendMessage(chatId, '📭 No command logs yet.');
+  const arg = (match[1] || '').trim();
+  let filter = {};
+  let limit = 20;
 
-    let text = `╔════════════════════╗\n  📋  *COMMAND LOG*\n╚════════════════════╝\n\n`;
-    
-    logs.forEach((log, i) => {
-      const time = new Date(log.timestamp).toLocaleString();
-      text += `${i + 1}. *${log.command}*\n`;
-      text += `   👤 \`${log.username}\` (${log.userId})\n`;
-      text += `   🕐 ${time}\n`;
-      text += `   📝 Params: ${JSON.stringify(log.params)}\n\n`;
-    });
+  if (!arg) {
+    // default: last 20
+  } else if (/^\d{4,}$/.test(arg)) {
+    // looks like a userId
+    filter.userId = arg;
+  } else if (/^\d{1,3}$/.test(arg)) {
+    limit = Math.min(parseInt(arg), 100);
+  } else if (arg === 'fail') {
+    filter.result = 'fail';
+  } else if (arg === 'ok') {
+    filter.result = 'ok';
+  } else if (arg === 'info') {
+    filter.result = 'info';
+  } else if (arg.startsWith('@')) {
+    filter.username = { $regex: arg.replace('@',''), $options: 'i' };
+  }
+
+  try {
+    const entries = await ActivityLog.find(filter).sort({ timestamp: -1 }).limit(limit).catch(() => []);
+    if (!entries.length) return bot.sendMessage(chatId, '📭 No logs found.');
+
+    const resultIcon = { ok: '✅', fail: '❌', info: '📋' };
+
+    let text = `╔════════════════════╗\n  📊  *BOT ACTIVITY LOG*\n╚════════════════════╝\n`;
+    text += `_Showing ${entries.length} entries${arg ? ' · filter: ' + arg : ''}_\n\n`;
+
+    for (const e of entries) {
+      const time = new Date(e.timestamp);
+      const timeStr = time.toLocaleString('en-GB', { hour12: false, timeZone: 'UTC' }) + ' UTC';
+      const icon = resultIcon[e.result] || '📋';
+      text += `${icon} *${e.action}*
+`;
+      text += `   👤 ${e.username} \`${e.userId}\`
+`;
+      if (e.detail) text += `   📝 ${e.detail}\n`;
+      text += `   🕐 ${timeStr}\n\n`;
+    }
+
+    // Split if too long (Telegram 4096 char limit)
+    if (text.length > 3800) {
+      const chunks = [];
+      const lines = text.split('\n\n');
+      let chunk = '';
+      for (const line of lines) {
+        if ((chunk + line).length > 3500) {
+          chunks.push(chunk);
+          chunk = line + '\n\n';
+        } else {
+          chunk += line + '\n\n';
+        }
+      }
+      if (chunk) chunks.push(chunk);
+      for (const c of chunks) {
+        await bot.sendMessage(chatId, c, { parse_mode: 'Markdown' }).catch(() =>
+          bot.sendMessage(chatId, c)
+        );
+      }
+    } else {
+      bot.sendMessage(chatId, text, { parse_mode: 'Markdown' }).catch(() =>
+        bot.sendMessage(chatId, text)
+      );
+    }
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Error loading logs: ' + e.message);
+  }
+});
+
+/* /logstats — summary counts per action */
+bot.onText(/^\/logstats$/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  try {
+    const total      = await ActivityLog.countDocuments();
+    const ok         = await ActivityLog.countDocuments({ result: 'ok' });
+    const fail       = await ActivityLog.countDocuments({ result: 'fail' });
+    const today      = new Date(); today.setUTCHours(0,0,0,0);
+    const todayCount = await ActivityLog.countDocuments({ timestamp: { $gte: today } });
+
+    const pipeline = await ActivityLog.aggregate([
+      { $group: { _id: '$action', count: { $sum: 1 } } },
+      { $sort:  { count: -1 } },
+      { $limit: 10 }
+    ]);
+
+    let text = `╔════════════════════╗\n  📊  *LOG STATS*\n╚════════════════════╝\n\n`;
+    text += `📦 Total entries: *${total}*\n`;
+    text += `✅ Success: *${ok}*   ❌ Fail: *${fail}*\n`;
+    text += `🕐 Today: *${todayCount}*\n\n`;
+    text += `*Top Actions:*\n`;
+    pipeline.forEach(p => { text += `  • \`${p._id}\` — *${p.count}*\n`; });
 
     bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
   } catch(e) {
-    bot.sendMessage(chatId, '❌ Error loading logs.');
+    bot.sendMessage(chatId, '❌ Error: ' + e.message);
   }
 });
 
@@ -1075,6 +1334,7 @@ bot.onText(/^\/ban (\d+)$/, async (msg, match) => {
   const userId = match[1];
   try {
     await banUser(userId);
+    log(msg, '/ban', `target=${userId}`, 'ok');
     bot.sendMessage(chatId,
 `🚫 *User banned!*
 
@@ -1094,6 +1354,7 @@ bot.onText(/^\/unban (\d+)$/, async (msg, match) => {
   const userId = match[1];
   try {
     await unbanUser(userId);
+    log(msg, '/unban', `target=${userId}`, 'ok');
     bot.sendMessage(chatId,
 `✅ *User unbanned!*
 
@@ -1135,6 +1396,7 @@ bot.on('message', async (msg) => {
 
   const warns = warnDoc ? warnDoc.count : 1;
 
+  log(msg, 'antilink:warn', `warns=${warns} user=${userId}`, 'fail');
   if (warns >= 3) {
     const until = Math.floor(Date.now() / 1000) + MUTE_DURATION;
     try {
@@ -1164,7 +1426,11 @@ bot.on('message', async (msg) => {
 📅 Mute expires in 7 days`,
         { parse_mode: 'Markdown' });
     } catch(e) {
-      bot.sendMessage(chatId, `⚠️ Could not mute ${name} — make sure I'm an admin with restrict permissions.`);
+      // Mute failed (bot not admin etc.) — reset warns so user gets warning cycle again
+      await Warn.updateOne({ userId: String(userId) }, { count: 2 }).catch(() => {});
+      bot.sendMessage(chatId, `⚠️ Could not mute ${name} — make sure I'm an admin with restrict permissions.
+
+⚠️ Warning *3/3* kept active.`, { parse_mode: 'Markdown' });
     }
   } else {
     bot.sendMessage(chatId,
@@ -1190,11 +1456,14 @@ bot.on('message', async (msg) => {
     bot.sendMessage(chatId, '🔄 Verifying ref code...');
     const d = await apiCheck(ref);
     if (!d.ok) {
+      log(msg, 'claim:ref_fail', `ref=${ref} err=${d.msg||'invalid'}`, 'fail');
       bot.sendMessage(chatId, `❌ *Invalid ref code.*\n\n${d.msg || ''}\n\nTry /claim again.`, { parse_mode: 'Markdown' });
       resetSession(chatId); return;
     }
     session.data.ref = ref;
     session.step = 'awaiting_email';
+    await saveSession(chatId, session);
+    log(msg, 'claim:ref_ok', `ref=${ref}`, 'ok');
     bot.sendMessage(chatId, `✅ *Ref code confirmed!*\n\n📧 Now send the *email* you want for this CPM2 account:`, { parse_mode: 'Markdown' });
     return;
   }
@@ -1205,6 +1474,8 @@ bot.on('message', async (msg) => {
     }
     session.data.email = text;
     session.step = 'awaiting_password';
+    await saveSession(chatId, session);
+    log(msg, 'claim:email_set', `email=${text}`, 'info');
     bot.sendMessage(chatId, `🔑 Now send a *password* for the account:\n_Minimum 6 characters_`, { parse_mode: 'Markdown' });
     return;
   }
@@ -1221,12 +1492,13 @@ bot.on('message', async (msg) => {
     try {
       const d = await apiClaim(session.data.ref, session.data.email, session.data.password);
       if (!d.ok) {
-        // Claim failed — refund coins regardless of path
-        await addCoins(msg.from.id, price);
-        // Clear the pending ref so they can try again
+        log(msg, 'claim:fail', `ref=${session.data.ref} err=${d.msg||'unknown'} refund=${paidViaByuref}`, 'fail');
+        // Claim failed — only refund if coins were already taken (buyref path)
         await PendingRef.deleteOne({ userId: String(msg.from.id) }).catch(() => {});
-        const refunded = await getUserWallet(msg.from.id);
-        bot.sendMessage(chatId,
+        if (paidViaByuref) {
+          await addCoins(msg.from.id, price);
+          const refunded = await getUserWallet(msg.from.id);
+          bot.sendMessage(chatId,
 `❌ *Claim failed!*
 
 📋 Error: ${d.msg || 'Something went wrong.'}
@@ -1234,17 +1506,39 @@ bot.on('message', async (msg) => {
 💰 Coins refunded: *${price}*
 💳 New balance: *${refunded.balance}* coins
 
-Try another ref code or contact admin.`,
-          { parse_mode: 'Markdown' });
+Try again with /buyref or contact admin.`,
+            { parse_mode: 'Markdown' });
+        } else {
+          bot.sendMessage(chatId,
+`❌ *Claim failed!*
+
+📋 Error: ${d.msg || 'Something went wrong.'}
+
+💰 No coins were deducted.
+
+Try again with /claim or contact admin.`,
+            { parse_mode: 'Markdown' });
+        }
       } else {
-        // Claim successful
+        // Claim successful — deduct now if not already done via /buyref
         if (!paidViaByuref) {
-          // Coins not yet deducted — deduct now
           await removeCoins(msg.from.id, price);
         }
-        // Clear pending ref reservation
         await PendingRef.deleteOne({ userId: String(msg.from.id) }).catch(() => {});
         const updated = await getUserWallet(msg.from.id);
+        log(msg, 'claim:success', `ref=${session.data.ref} email=${session.data.email} coins=${price}`, 'ok');
+        // Update leaderboard stats on wallet
+        await BotWallet.findOneAndUpdate(
+          { userId: String(msg.from.id) },
+          {
+            $inc: { claims: 1 },
+            $set: {
+              username:    msg.from.username ? '@' + msg.from.username : '',
+              displayName: msg.from.first_name || ''
+            }
+          },
+          { upsert: true }
+        ).catch(() => {});
 
         bot.sendMessage(chatId,
 `╔══════════════════╗
@@ -1265,10 +1559,15 @@ Try another ref code or contact admin.`,
           { parse_mode: 'Markdown' });
       }
     } catch(e) {
-      // Network error — refund coins and clear pending ref
-      await addCoins(msg.from.id, price);
+      // Network error — only refund if coins were already taken
+      log(msg, 'claim:network_error', `ref=${session.data.ref} refund=${paidViaByuref}`, 'fail');
       await PendingRef.deleteOne({ userId: String(msg.from.id) }).catch(() => {});
-      bot.sendMessage(chatId, '❌ Network error. Coins refunded. Contact admin.');
+      if (paidViaByuref) {
+        await addCoins(msg.from.id, price);
+        bot.sendMessage(chatId, '❌ Network error. Your coins have been refunded. Contact admin.');
+      } else {
+        bot.sendMessage(chatId, '❌ Network error. No coins were deducted. Contact admin.');
+      }
     }
     resetSession(chatId);
   }
@@ -1286,6 +1585,10 @@ mongoose.connect(MONGO_URI)
     console.log(`👥 Loaded ${knownUsers.size} known user(s)`);
     // Load schedules
     await loadSchedules();
+    // Restore sessions from DB (survive restarts)
+    const savedSessions = await SessionStore.find().catch(() => []);
+    savedSessions.forEach(s => { sessions[s.chatId] = { step: s.step, data: s.data }; });
+    if (savedSessions.length) console.log(`🔄 Restored ${savedSessions.length} session(s) from DB`);
     console.log('🤖 Kalypo Mods Telegram bot is running...');
   })
   .catch(err => {
