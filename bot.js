@@ -195,10 +195,28 @@ async function saveUser(chatId) {
   }
 }
 
-async function getUserWallet(userId) {
+async function getUserWallet(userId, from = null) {
   try {
     let w = await BotWallet.findOne({ userId: String(userId) });
-    if (!w) w = await BotWallet.create({ userId: String(userId), balance: 0 });
+    if (!w) {
+      const data = { userId: String(userId), balance: 0 };
+      if (from) {
+        data.username    = from.username ? '@' + from.username : '';
+        data.displayName = from.first_name || '';
+      }
+      w = await BotWallet.create(data);
+    } else if (from) {
+      // Refresh name in case it changed
+      w = await BotWallet.findOneAndUpdate(
+        { userId: String(userId) },
+        { $set: {
+            username:    from.username ? '@' + from.username : '',
+            displayName: from.first_name || ''
+          }
+        },
+        { new: true }
+      );
+    }
     return w;
   } catch(e) {
     console.error('Error getting wallet:', e.message);
@@ -368,6 +386,16 @@ bot.onText(/^\/start$/, async (msg) => {
       return;
     }
     saveUser(msg.from.id);
+    // Save name/username so leaderboard always shows real names
+    await BotWallet.findOneAndUpdate(
+      { userId: String(msg.from.id) },
+      { $set: {
+          username:    msg.from.username ? '@' + msg.from.username : '',
+          displayName: msg.from.first_name || ''
+        }
+      },
+      { upsert: true }
+    ).catch(() => {});
   }
   log(msg, '/start', '', 'info');
   resetSession(chatId);
@@ -455,6 +483,8 @@ bot.onText(/^\/claim$/, async (msg) => {
   const userId = msg.from.id;
   const price  = parseInt(PRICE_COINS);
   log(msg, '/claim', 'started', 'info');
+  const cdC = checkCooldown(String(userId), 'claim', 30);
+  if (!cdC.ok) return bot.sendMessage(chatId, '⏳ *Cooldown!* Try /claim again in *'+cdC.remaining+'s*.', { parse_mode: 'Markdown' });
 
   // Check if user already has a pending ref from /buyref (coins already paid)
   const pending = await PendingRef.findOne({ userId: String(userId) }).catch(() => null);
@@ -506,7 +536,9 @@ bot.onText(/^\/wallet$/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   log(msg, '/wallet', '', 'info');
-  const w = await getUserWallet(userId);
+  const cdW = checkCooldown(String(userId), 'wallet', 10);
+  if (!cdW.ok) return bot.sendMessage(chatId, '⏳ Check your wallet again in *'+cdW.remaining+'s*.', { parse_mode: 'Markdown' });
+  const w = await getUserWallet(userId, msg.from);
   const price = parseInt(PRICE_COINS);
   const balance = w ? w.balance : 0;
   const canAfford = balance >= price;
@@ -524,25 +556,148 @@ ${canAfford
     { parse_mode: 'Markdown' });
 });
 
-bot.onText(/^\/wallets$/, async (msg) => {
+/* ═══════════════════════════════════
+   COOLDOWN SYSTEM
+   Prevents command spam — per-user, per-command throttle
+═══════════════════════════════════ */
+const cooldowns = {}; // { userId: { command: lastUsedTimestamp } }
+
+function checkCooldown(userId, command, seconds) {
+  const now = Date.now();
+  if (!cooldowns[userId]) cooldowns[userId] = {};
+  const last = cooldowns[userId][command] || 0;
+  const diff = now - last;
+  if (diff < seconds * 1000) {
+    const remaining = Math.ceil((seconds * 1000 - diff) / 1000);
+    return { ok: false, remaining };
+  }
+  cooldowns[userId][command] = now;
+  return { ok: true };
+}
+
+// Clean up cooldown memory every 10 min
+setInterval(() => {
+  const now = Date.now();
+  for (const uid of Object.keys(cooldowns)) {
+    for (const cmd of Object.keys(cooldowns[uid])) {
+      if (now - cooldowns[uid][cmd] > 5 * 60 * 1000) delete cooldowns[uid][cmd];
+    }
+    if (!Object.keys(cooldowns[uid]).length) delete cooldowns[uid];
+  }
+}, 10 * 60 * 1000);
+
+/* ═══════════════════════════════════
+   /send — coin transfer (all users)
+═══════════════════════════════════ */
+bot.onText(/^\/send (@?\S+) (\d+)$/, async (msg, match) => {
+  const chatId    = msg.chat.id;
+  const senderId  = String(msg.from.id);
+  const rawTarget = match[1];
+  const amount    = parseInt(match[2]);
+
+  // Cooldown: 1 transfer per 30 seconds
+  const cd = checkCooldown(senderId, 'send', 30);
+  if (!cd.ok) {
+    return bot.sendMessage(chatId,
+`⏳ *Slow down!*
+
+You can send coins again in *${cd.remaining}s*.`,
+      { parse_mode: 'Markdown' });
+  }
+
+  if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
+  if (amount < 10) return bot.sendMessage(chatId, '❌ Minimum transfer is 10 coins.');
+
+  log(msg, '/send', 'target='+rawTarget+' amount='+amount, 'info');
+
+  // Resolve recipient
+  let recipientId, recipientName;
+  if (rawTarget.startsWith('@')) {
+    const uname = rawTarget.replace(/^@/, '');
+    const rw = await BotWallet.findOne({ username: { $regex: '^@?'+uname+'$', $options: 'i' } });
+    if (!rw) return bot.sendMessage(chatId, '❌ User @'+uname+' not found. They must have used the bot first.');
+    if (rw.userId === senderId) return bot.sendMessage(chatId, '❌ You cannot send coins to yourself.');
+    recipientId   = rw.userId;
+    recipientName = '@'+uname;
+  } else {
+    if (rawTarget === senderId) return bot.sendMessage(chatId, '❌ You cannot send coins to yourself.');
+    recipientId   = rawTarget;
+    recipientName = '`'+rawTarget+'`';
+  }
+
+  // Check sender balance
+  const senderWallet = await getUserWallet(senderId, msg.from);
+  if (!senderWallet || senderWallet.balance < amount) {
+    return bot.sendMessage(chatId,
+`❌ *Insufficient coins!*
+
+💰 Your balance: *${senderWallet ? senderWallet.balance : 0}* coins
+💸 You need: *${amount}* coins`,
+      { parse_mode: 'Markdown' });
+  }
+
+  // Deduct from sender
+  const deducted = await removeCoins(senderId, amount);
+  if (!deducted) return bot.sendMessage(chatId, '❌ Transfer failed. Try again.');
+
+  // Credit recipient
+  const credited = await addCoins(recipientId, amount);
+  if (!credited) {
+    await addCoins(senderId, amount); // refund
+    return bot.sendMessage(chatId, '❌ Could not credit recipient. Your coins have been refunded.');
+  }
+
+  log(msg, '/send', 'from='+senderId+' to='+recipientId+' amount='+amount, 'ok');
+
+  const senderName = msg.from.username ? '@'+msg.from.username : msg.from.first_name;
+
+  bot.sendMessage(chatId,
+`╔══════════════════╗
+  💸  *TRANSFER SENT!*
+╚══════════════════╝
+
+📤 To: ${recipientName}
+💰 Amount: *${amount}* coins
+💳 Your new balance: *${deducted.balance}* coins`,
+    { parse_mode: 'Markdown' });
+
+  bot.sendMessage(recipientId,
+`╔══════════════════╗
+  💰  *COINS RECEIVED!*
+╚══════════════════╝
+
+📥 *${amount}* coins from ${senderName}
+💳 New balance: *${credited.balance}* coins`,
+    { parse_mode: 'Markdown' }).catch(() => {});
+});
+
+// /finduser @username or name — search wallet by username/name
+bot.onText(/^\/finduser (.+)$/, async (msg, match) => {
   const chatId = msg.chat.id;
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
 
-  bot.sendMessage(chatId, '🔄 Loading wallets...');
+  const query = match[1].trim().replace(/^@/, '');
   try {
-    const wallets = await BotWallet.find().sort({ balance: -1 }).limit(50).catch(() => []);
-    if (!wallets.length) return bot.sendMessage(chatId, '📭 No wallets yet.');
+    const results = await BotWallet.find({
+      $or: [
+        { username:    { $regex: query, $options: 'i' } },
+        { displayName: { $regex: query, $options: 'i' } },
+        { userId: query }
+      ]
+    }).limit(10);
 
-    let text = `╔════════════════════╗\n  💰  *ALL USER WALLETS*\n╚════════════════════╝\n\n`;
-    text += `Total users: *${wallets.length}*\n\n`;
-    
-    wallets.forEach((w, i) => {
-      text += `${i + 1}. 👤 \`${w.userId}\`\n   💳 *${w.balance}* coins\n\n`;
+    if (!results.length) return bot.sendMessage(chatId, `❌ No users found matching *${query}*`, { parse_mode: 'Markdown' });
+
+    let text = `╔════════════════════╗\n  🔍  *SEARCH RESULTS*\n╚════════════════════╝\n\n`;
+    results.forEach(w => {
+      const name = w.displayName || w.username || 'Unknown';
+      const handle = w.username ? ` (${w.username})` : '';
+      text += `👤 *${name}*${handle}\n🆔 \`${w.userId}\`\n💳 *${w.balance}* coins  🏆 ${w.claims || 0} claims\n\n`;
     });
 
     bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
   } catch(e) {
-    bot.sendMessage(chatId, '❌ Server error.');
+    bot.sendMessage(chatId, '❌ Error: ' + e.message);
   }
 });
 
@@ -550,125 +705,167 @@ bot.onText(/^\/wallets$/, async (msg) => {
 
 /* ═══════════════════════════════════
    ADMIN WALLET COMMANDS
+   /gc  — give coins  (reply | userId | @username)
+   /rc  — remove coins (same targeting)
+   /setbal — set exact balance
 ═══════════════════════════════════ */
-// /gc <amount>        — reply to someone's message to give them coins
-// /gc <userId> <amount> — explicit userId (works anywhere)
-bot.onText(/^\/gc(?: (\d+))? (\d+)$/, async (msg, match) => {
-  const chatId  = msg.chat.id;
-  const inGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
 
-  if (!ADMIN_IDS.includes(String(msg.from.id))) {
-    if (!inGroup) bot.sendMessage(chatId, '🚫 Admin only.');
-    return;
-  }
-
-  // Resolve target userId:
-  // - If replying to a message → use that user's ID
-  // - If first capture group present → use it as userId
-  // - Otherwise invalid
-  let userId, targetName;
+/* Shared helper: resolve admin target from reply / userId / @username */
+async function resolveTarget(msg, userArg) {
   if (msg.reply_to_message) {
     const sender = msg.reply_to_message.from;
-    if (!sender || sender.is_bot) {
-      if (!inGroup) bot.sendMessage(chatId, '❌ Can\'t give coins to a bot.');
-      return;
-    }
-    userId     = String(sender.id);
-    targetName = sender.username ? `@${sender.username}` : sender.first_name;
-  } else if (match[1]) {
-    userId     = match[1];
-    targetName = `\`${userId}\``;
-  } else {
-    if (!inGroup) bot.sendMessage(chatId, '❌ Either reply to someone\'s message or use /gc <userId> <amount>');
-    return;
+    if (!sender || sender.is_bot) return { err: "Can't target a bot." };
+    await BotWallet.findOneAndUpdate(
+      { userId: String(sender.id) },
+      { $set: { username: sender.username ? '@' + sender.username : '', displayName: sender.first_name || '' } },
+      { upsert: true }
+    ).catch(() => {});
+    return {
+      userId: String(sender.id),
+      targetName: sender.username ? '@' + sender.username : sender.first_name
+    };
   }
-
-  const amount = parseInt(match[2]);
-  if (amount <= 0) return;
-
-  try {
-    await CommandLog.create({
-      userId: String(msg.from.id),
-      username: msg.from.username || msg.from.first_name || 'Unknown',
-      command: 'gc',
-      params: { targetUserId: userId, amount }
-    }).catch(() => {});
-
-    const w = await addCoins(userId, amount);
-    if (!w) {
-      if (!inGroup) bot.sendMessage(chatId, '❌ Error updating balance.');
-      return;
+  if (userArg) {
+    if (userArg.startsWith('@')) {
+      const uname = userArg.replace(/^@/, '');
+      const w = await BotWallet.findOne({ username: { $regex: '^@?' + uname + '$', $options: 'i' } });
+      if (!w) return { err: `No user found with username @${uname}. They must have used the bot first.` };
+      return { userId: w.userId, targetName: '@' + uname };
     }
-    // Save target's display name if we got it from reply
-    if (msg.reply_to_message?.from) {
-      const t = msg.reply_to_message.from;
-      await BotWallet.findOneAndUpdate(
-        { userId: String(userId) },
-        { $set: { username: t.username ? '@'+t.username : '', displayName: t.first_name||'' } }
-      ).catch(() => {});
+    return { userId: userArg, targetName: `\`${userArg}\`` };
+  }
+  return { err: 'Reply to a message or specify a userId / @username.' };
+}
+
+function adminCoinMsg(action, targetName, userId, delta, newBal) {
+  const icon = delta > 0 ? '➕' : '➖';
+  const word = delta > 0 ? 'Added' : 'Removed';
+  return `✅ *Coins ${word}!*\n\n👤 User: ${targetName}\n🆔 ID: \`${userId}\`\n${icon} ${word}: *${Math.abs(delta)}* coins\n💰 New Balance: *${newBal}* coins`;
+}
+
+// /gc <amount>            — reply to give coins
+// /gc <userId|@u> <amount>
+bot.onText(/^\/gc (\d+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const inGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+  if (!ADMIN_IDS.includes(String(msg.from.id))) { if (!inGroup) bot.sendMessage(chatId, '🚫 Admin only.'); return; }
+  if (!msg.reply_to_message) return bot.sendMessage(chatId, '❌ Reply to someone, or use: /gc <userId|@username> <amount>');
+
+  const { userId, targetName, err } = await resolveTarget(msg, null);
+  if (err) return bot.sendMessage(chatId, '❌ ' + err);
+  const amount = parseInt(match[1]);
+  if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
+
+  const w = await addCoins(userId, amount);
+  if (!w) return bot.sendMessage(chatId, '❌ Error updating balance.');
+  log(msg, '/gc', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
+
+  const txt = adminCoinMsg('Added', targetName, userId, amount, w.balance);
+  bot.sendMessage(userId,
+`╔══════════════════╗\n  🎁  *COINS RECEIVED!*\n╚══════════════════╝\n\n💰 You received *${amount}* coins from admin!\n💳 New Balance: *${w.balance}* coins\n\nUse /wallet to check your balance.`,
+    { parse_mode: 'Markdown' }).catch(() => {});
+
+  if (inGroup) {
+    bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+    const sent = await bot.sendMessage(msg.from.id, txt, { parse_mode: 'Markdown' }).then(() => true).catch(() => false);
+    if (!sent) {
+      const tmp = await bot.sendMessage(chatId, txt, { parse_mode: 'Markdown', disable_notification: true }).catch(() => null);
+      if (tmp) setTimeout(() => bot.deleteMessage(chatId, tmp.message_id).catch(() => {}), 6000);
     }
-
-    if (inGroup) {
-      // Delete the admin's command message
-      bot.deleteMessage(chatId, msg.message_id).catch(() => {});
-
-      // Try DM first, fall back to a self-destructing group reply only you can see
-      const confirmText =
-`✅ *Done (silent)*
-
-👤 User: ${targetName}
-🆔 ID: \`${userId}\`
-➕ Added: *${amount}* coins
-💰 New Balance: *${w.balance}* coins`;
-
-      const dmSent = await bot.sendMessage(msg.from.id, confirmText, { parse_mode: 'Markdown' })
-        .then(() => true)
-        .catch(() => false);
-
-      if (!dmSent) {
-        // DM failed (haven't started bot in DM) — send in group, auto-delete after 6s
-        const tempMsg = await bot.sendMessage(chatId, confirmText, {
-          parse_mode: 'Markdown',
-          disable_notification: true
-        }).catch(() => null);
-        if (tempMsg) {
-          setTimeout(() => bot.deleteMessage(chatId, tempMsg.message_id).catch(() => {}), 6000);
-        }
-      }
-    } else {
-      bot.sendMessage(chatId,
-`✅ *Coins added!*
-
-👤 User: ${targetName}
-🆔 ID: \`${userId}\`
-➕ Added: *${amount}* coins
-💰 New Balance: *${w.balance}* coins`,
-        { parse_mode: 'Markdown' });
-    }
-  } catch(e) {
-    if (!inGroup) bot.sendMessage(chatId, '❌ Error: ' + e.message);
+  } else {
+    bot.sendMessage(chatId, txt, { parse_mode: 'Markdown' });
   }
 });
 
-bot.onText(/^\/removecoins (\d+) (\d+)$/, async (msg, match) => {
+bot.onText(/^\/gc (@?\S+) (\d+)$/, async (msg, match) => {
   const chatId = msg.chat.id;
-  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  const inGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+  if (!ADMIN_IDS.includes(String(msg.from.id))) { if (!inGroup) bot.sendMessage(chatId, '🚫 Admin only.'); return; }
 
-  const userId = match[1];
+  const { userId, targetName, err } = await resolveTarget(msg, match[1]);
+  if (err) return bot.sendMessage(chatId, '❌ ' + err);
   const amount = parseInt(match[2]);
-
   if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
 
-  const w = await removeCoins(userId, amount);
-  if (!w) { log(msg, '/removecoins', `target=${userId} amount=${amount} FAIL`, 'fail'); return bot.sendMessage(chatId, `❌ User doesn't have enough coins or doesn't exist.`); }
-  log(msg, '/removecoins', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
-  bot.sendMessage(chatId,
-`✅ *Coins removed!*
+  await CommandLog.create({ userId: String(msg.from.id), username: msg.from.username || msg.from.first_name || 'Unknown', command: 'gc', params: { targetUserId: userId, amount } }).catch(() => {});
+  const w = await addCoins(userId, amount);
+  if (!w) return bot.sendMessage(chatId, '❌ Error updating balance.');
+  log(msg, '/gc', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
 
-👤 User: \`${userId}\`
-➖ Removed: *${amount}* coins
-💰 New Balance: *${w.balance}* coins`,
-    { parse_mode: 'Markdown' });
+  const txt = adminCoinMsg('Added', targetName, userId, amount, w.balance);
+  bot.sendMessage(userId,
+`╔══════════════════╗\n  🎁  *COINS RECEIVED!*\n╚══════════════════╝\n\n💰 You received *${amount}* coins from admin!\n💳 New Balance: *${w.balance}* coins\n\nUse /wallet to check your balance.`,
+    { parse_mode: 'Markdown' }).catch(() => {});
+
+  if (inGroup) {
+    bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+    const sent = await bot.sendMessage(msg.from.id, txt, { parse_mode: 'Markdown' }).then(() => true).catch(() => false);
+    if (!sent) {
+      const tmp = await bot.sendMessage(chatId, txt, { parse_mode: 'Markdown', disable_notification: true }).catch(() => null);
+      if (tmp) setTimeout(() => bot.deleteMessage(chatId, tmp.message_id).catch(() => {}), 6000);
+    }
+  } else {
+    bot.sendMessage(chatId, txt, { parse_mode: 'Markdown' });
+  }
+});
+
+// /rc <amount>            — reply to remove coins
+// /rc <userId|@u> <amount>
+bot.onText(/^\/rc (\d+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  if (!msg.reply_to_message) return bot.sendMessage(chatId, '❌ Reply to someone, or use: /rc <userId|@username> <amount>');
+  const { userId, targetName, err } = await resolveTarget(msg, null);
+  if (err) return bot.sendMessage(chatId, '❌ ' + err);
+  const amount = parseInt(match[1]);
+  if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
+  const w = await removeCoins(userId, amount);
+  if (!w) return bot.sendMessage(chatId, "❌ User doesn't have enough coins or doesn't exist.");
+  log(msg, '/rc', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
+  bot.sendMessage(chatId, adminCoinMsg('Removed', targetName, userId, -amount, w.balance), { parse_mode: 'Markdown' });
+});
+
+bot.onText(/^\/rc (@?\S+) (\d+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  const { userId, targetName, err } = await resolveTarget(msg, match[1]);
+  if (err) return bot.sendMessage(chatId, '❌ ' + err);
+  const amount = parseInt(match[2]);
+  if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
+  const w = await removeCoins(userId, amount);
+  if (!w) return bot.sendMessage(chatId, "❌ User doesn't have enough coins or doesn't exist.");
+  log(msg, '/rc', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
+  bot.sendMessage(chatId, adminCoinMsg('Removed', targetName, userId, -amount, w.balance), { parse_mode: 'Markdown' });
+});
+
+// /setbal <userId|@u> <amount> — set exact balance
+bot.onText(/^\/setbal (@?\S+) (\d+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  const { userId, targetName, err } = await resolveTarget(msg, match[1]);
+  if (err) return bot.sendMessage(chatId, '❌ ' + err);
+  const amount = parseInt(match[2]);
+  try {
+    const w = await BotWallet.findOneAndUpdate({ userId: String(userId) }, { $set: { balance: amount } }, { upsert: true, new: true });
+    log(msg, '/setbal', `target=${userId} amount=${amount}`, 'ok');
+    bot.sendMessage(chatId,
+`✅ *Balance Set!*\n\n👤 User: ${targetName}\n🆔 ID: \`${userId}\`\n💳 New Balance: *${w.balance}* coins`,
+      { parse_mode: 'Markdown' });
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Error: ' + e.message);
+  }
+});
+
+// Legacy alias kept for backwards compat
+bot.onText(/^\/removecoins (\d+) (\d+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only. (Tip: use /rc instead)');
+  const userId = match[1], amount = parseInt(match[2]);
+  if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
+  const w = await removeCoins(userId, amount);
+  if (!w) return bot.sendMessage(chatId, "❌ User doesn't have enough coins or doesn't exist.");
+  log(msg, '/removecoins', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
+  bot.sendMessage(chatId, adminCoinMsg('Removed', `\`${userId}\``, userId, -amount, w.balance), { parse_mode: 'Markdown' });
 });
 
 /* ═══════════════════════════════════
@@ -680,6 +877,9 @@ bot.onText(/^\/buyref$/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
   const price = parseInt(PRICE_COINS);
+
+  const cdB = checkCooldown(String(userId), 'buyref', 60);
+  if (!cdB.ok) return bot.sendMessage(chatId, '⏳ *Cooldown!* Try /buyref again in *'+cdB.remaining+'s*.', { parse_mode: 'Markdown' });
 
   // Check if user already has a pending reserved ref
   const existing = await PendingRef.findOne({ userId: String(userId) }).catch(() => null);
@@ -853,32 +1053,34 @@ bot.onText(/^\/menu$/, (msg) => {
 
 👤 *CUSTOMER COMMANDS*
 ┌──────────────────────────┐
-│ 🏠 /start      — welcome screen        │
-│ 💳 /pay        — payment info           │
-│ 🪙 /wallet     — check coin balance    │
-│ 🔑 /buyref     — buy ref code          │
-│ 🎮 /claim      — activate account      │
-│ 📟 /menu       — show this menu        │
-│ 🪪 /myid       — your Telegram ID      │
-│ 🏆 /top        — coin leaderboard      │
-│ 🏅 /rank       — your rank & stats     │
+│ 🏠 /start       — welcome screen       │
+│ 💳 /pay         — payment info          │
+│ 🪙 /wallet      — check coin balance   │
+│ 💸 /send @u amt — transfer coins       │
+│ 🔑 /buyref      — buy ref code         │
+│ 🎮 /claim       — activate account     │
+│ 📟 /menu        — show this menu       │
+│ 🪪 /myid        — your Telegram ID     │
+│ 🏆 /top         — coin leaderboard     │
+│ 🏅 /rank        — your rank & stats    │
 └──────────────────────────┘${admin ? `
 
 🔐 *ADMIN COMMANDS*
 ┌──────────────────────────┐
-│ ➖ /removecoins <id> <amt> — remove coins │
-│ 💳 /wallets                 — all wallets    │
-│ 📋 /list                    — all accounts  │
-│ 🟡 /pending                — reserved      │
-│ 📊 /stock                  — stock status  │
-│ ✅ /approve <id>          — give ref      │
-│ 🔄 /reset <ref>           — reset account │
-│ 📢 /broadcast <msg>       — DM all users  │
-│ 📅 /schedule <time> <msg> — daily msg     │
-│ 🗑️ /unschedule <time>     — cancel        │
-│ 📋 /schedules             — list active   │
-│ 📊 /logs [n/fail/ok/id]  — activity log  │
-│ 📈 /logstats              — log summary   │
+│ ➕ /gc @u amt    — give coins           │
+│ ➖ /rc @u amt    — remove coins         │
+│ 🎯 /setbal @u amt — set exact balance  │
+│ 💳 /wallets      — all wallets w/ names│
+│ 🔍 /finduser x   — search by name/@    │
+│ 📋 /list         — all accounts        │
+│ 🟡 /pending      — reserved accounts   │
+│ 📊 /stock        — stock status        │
+│ ✅ /approve <id>  — give ref           │
+│ 🔄 /reset <ref>  — reset account       │
+│ 📢 /broadcast    — DM all users        │
+│ 📅 /schedule     — daily msg           │
+│ 📊 /logs         — activity log        │
+│ 📈 /logstats     — log summary         │
 └──────────────────────────┘
 
 👥 *Users tracked:* ${knownUsers.size}
@@ -1141,6 +1343,8 @@ bot.onText(/^\/top(?: (coins|claims))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const mode = (match[1] || 'coins').toLowerCase();
   log(msg, '/top', mode, 'info');
+  const cdT = checkCooldown(String(msg.from.id), 'top', 20);
+  if (!cdT.ok) return bot.sendMessage(chatId, '⏳ Check the leaderboard again in *'+cdT.remaining+'s*.', { parse_mode: 'Markdown' });
 
   try {
     const sortField = mode === 'claims' ? { claims: -1 } : { balance: -1 };
@@ -1173,9 +1377,11 @@ bot.onText(/^\/rank$/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = String(msg.from.id);
   log(msg, '/rank', '', 'info');
+  const cdR = checkCooldown(userId, 'rank', 15);
+  if (!cdR.ok) return bot.sendMessage(chatId, '⏳ Check your rank again in *'+cdR.remaining+'s*.', { parse_mode: 'Markdown' });
 
   try {
-    const w = await getUserWallet(userId);
+    const w = await getUserWallet(userId, msg.from);
     if (!w) return bot.sendMessage(chatId, '❌ No wallet found. Use /start first.');
 
     // Count how many users have more coins / more claims
