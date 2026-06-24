@@ -671,6 +671,39 @@ You can send coins again in *${cd.remaining}s*.`,
     { parse_mode: 'Markdown' }).catch(() => {});
 });
 
+/* ═══════════════════════════════════
+   /wallets — list all users with names
+═══════════════════════════════════ */
+bot.onText(/^\/wallets$/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  log(msg, '/wallets', '', 'info');
+  bot.sendMessage(chatId, '🔄 Loading wallets...');
+  try {
+    const wallets = await BotWallet.find().sort({ balance: -1 }).lean();
+    if (!wallets.length) return bot.sendMessage(chatId, '📭 No wallets yet.');
+
+    const total = wallets.reduce((s, w) => s + (w.balance || 0), 0);
+    let chunks = [];
+    let text = `╔════════════════════╗\n  💰  *ALL USER WALLETS*\n╚════════════════════╝\n\nTotal users: *${wallets.length}*  |  Total coins: *${total}*\n\n`;
+
+    wallets.forEach((w, i) => {
+      const name   = w.displayName || (w.username ? w.username.replace('@','') : null) || 'Unknown';
+      const handle = w.username ? ` (${w.username})` : '';
+      const line   = `${i + 1}. 👤 *${name}*${handle}\n   🆔 \`${w.userId}\`\n   💳 *${w.balance || 0}* coins  🏆 ${w.claims || 0} claims\n\n`;
+      if ((text + line).length > 3800) { chunks.push(text); text = ''; }
+      text += line;
+    });
+    if (text) chunks.push(text);
+
+    for (const chunk of chunks) {
+      await bot.sendMessage(chatId, chunk, { parse_mode: 'Markdown' }).catch(() => bot.sendMessage(chatId, chunk));
+    }
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Error: ' + e.message);
+  }
+});
+
 // /finduser @username or name — search wallet by username/name
 bot.onText(/^\/finduser (.+)$/, async (msg, match) => {
   const chatId = msg.chat.id;
@@ -777,7 +810,7 @@ bot.onText(/^\/gc (\d+)$/, async (msg, match) => {
   }
 });
 
-bot.onText(/^\/gc (@?\S+) (\d+)$/, async (msg, match) => {
+bot.onText(/^\/gc (@\S+|[^\d]\S*) (\d+)$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const inGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
   if (!ADMIN_IDS.includes(String(msg.from.id))) { if (!inGroup) bot.sendMessage(chatId, '🚫 Admin only.'); return; }
@@ -825,7 +858,7 @@ bot.onText(/^\/rc (\d+)$/, async (msg, match) => {
   bot.sendMessage(chatId, adminCoinMsg('Removed', targetName, userId, -amount, w.balance), { parse_mode: 'Markdown' });
 });
 
-bot.onText(/^\/rc (@?\S+) (\d+)$/, async (msg, match) => {
+bot.onText(/^\/rc (@\S+|[^\d]\S*) (\d+)$/, async (msg, match) => {
   const chatId = msg.chat.id;
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
   const { userId, targetName, err } = await resolveTarget(msg, match[1]);
@@ -946,11 +979,13 @@ _Your ref is reserved for you. Coins are refunded if claim fails._`,
 /* ═══════════════════════════════════
    ADMIN COMMANDS
 ═══════════════════════════════════ */
-bot.onText(/^\/approve (.+)$/, async (msg, match) => {
+bot.onText(/^\/approve(?: (.+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
 
-  const targetUserId = match[1].trim();
+  // Support: /approve (reply), /approve userId, /approve @username
+  const { userId: targetUserId, targetName, err } = await resolveTarget(msg, match[1] ? match[1].trim() : null);
+  if (err) return bot.sendMessage(chatId, '❌ ' + err + '\nUsage: reply to someone or use /approve <userId|@username>');
   log(msg, '/approve', `target=${targetUserId}`, 'info');
   bot.sendMessage(chatId, '🔄 Finding a free account...');
   try {
@@ -970,7 +1005,7 @@ bot.onText(/^\/approve (.+)$/, async (msg, match) => {
 `✅ *Approved!*
 
 🔑 Ref: \`${free.ref}\`
-👤 Reserved for: \`${targetUserId}\`
+👤 Reserved for: ${targetName} (\`${targetUserId}\`)
 _Ref is now locked to this user._`,
       { parse_mode: 'Markdown' });
 
