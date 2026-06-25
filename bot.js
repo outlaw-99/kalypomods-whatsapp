@@ -1232,6 +1232,20 @@ bot.onText(/^\/pending$/, async (msg) => {
 /* ─────────────────────────────────
    Inline keyboard — all button handlers
 ───────────────────────────────── */
+/* Helper: inject a fake message update so onText handlers fire correctly */
+function fakeMsg(query, text) {
+  return bot.processUpdate({
+    update_id: 0,
+    message: {
+      message_id: query.message.message_id,
+      from: query.from,
+      chat: query.message.chat,
+      date: Math.floor(Date.now() / 1000),
+      text
+    }
+  });
+}
+
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const msgId  = query.message.message_id;
@@ -1240,77 +1254,44 @@ bot.on('callback_query', async (query) => {
   bot.answerCallbackQuery(query.id).catch(() => {});
 
   // ── MENU buttons ──────────────────────────────────────────────────────────
-  if (data === 'menu_pay') {
-    bot.emit('text', { ...query.message, from: query.from, text: '/pay', chat: query.message.chat });
-    return;
-  }
-  if (data === 'menu_wallet') {
-    bot.emit('text', { ...query.message, from: query.from, text: '/wallet', chat: query.message.chat });
-    return;
-  }
-  if (data === 'menu_claim') {
-    bot.emit('text', { ...query.message, from: query.from, text: '/claim', chat: query.message.chat });
-    return;
-  }
-  if (data === 'menu_buyref') {
-    bot.emit('text', { ...query.message, from: query.from, text: '/buyref', chat: query.message.chat });
-    return;
-  }
-  if (data === 'menu_top') {
-    bot.emit('text', { ...query.message, from: query.from, text: '/top', chat: query.message.chat });
-    return;
-  }
-  if (data === 'menu_rank') {
-    bot.emit('text', { ...query.message, from: query.from, text: '/rank', chat: query.message.chat });
-    return;
-  }
-  if (data === 'menu_myid') {
-    bot.emit('text', { ...query.message, from: query.from, text: '/myid', chat: query.message.chat });
-    return;
-  }
+  if (data === 'menu_pay')    { fakeMsg(query, '/pay');      return; }
+  if (data === 'menu_wallet') { fakeMsg(query, '/wallet');   return; }
+  if (data === 'menu_claim')  { fakeMsg(query, '/claim');    return; }
+  if (data === 'menu_buyref') { fakeMsg(query, '/buyref');   return; }
+  if (data === 'menu_top')    { fakeMsg(query, '/top');      return; }
+  if (data === 'menu_rank')   { fakeMsg(query, '/rank');     return; }
+  if (data === 'menu_myid')   { fakeMsg(query, '/myid');     return; }
+  if (data === 'menu_ref')    { fakeMsg(query, '/referral'); return; }
+  if (data === 'menu_full')   { fakeMsg(query, '/menu');     return; }
   if (data === 'menu_send') {
     bot.sendMessage(chatId, '💸 *Send Coins*\n\nUsage: `/send @username 100`\nOr: `/send userId 100`\n\nMinimum: 10 coins · 30s cooldown between transfers', { parse_mode: 'Markdown' });
-    return;
-  }
-  if (data === 'menu_ref') {
-    bot.emit('text', { ...query.message, from: query.from, text: '/referral', chat: query.message.chat });
-    return;
-  }
-  if (data === 'menu_full') {
-    bot.emit('text', { ...query.message, from: query.from, text: '/menu', chat: query.message.chat });
     return;
   }
 
   // ── ADMIN panel buttons ───────────────────────────────────────────────────
   if (data === 'adm_stats') {
     if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
-    bot.emit('text', { ...query.message, from: query.from, text: '/stats', chat: query.message.chat });
-    return;
+    fakeMsg(query, '/stats');    return;
   }
   if (data === 'adm_wallets') {
     if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
-    bot.emit('text', { ...query.message, from: query.from, text: '/wallets', chat: query.message.chat });
-    return;
+    fakeMsg(query, '/wallets');  return;
   }
   if (data === 'adm_list') {
     if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
-    bot.emit('text', { ...query.message, from: query.from, text: '/list', chat: query.message.chat });
-    return;
+    fakeMsg(query, '/list');     return;
   }
   if (data === 'adm_pending') {
     if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
-    bot.emit('text', { ...query.message, from: query.from, text: '/pending', chat: query.message.chat });
-    return;
+    fakeMsg(query, '/pending');  return;
   }
   if (data === 'adm_stock') {
     if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
-    bot.emit('text', { ...query.message, from: query.from, text: '/stock', chat: query.message.chat });
-    return;
+    fakeMsg(query, '/stock');    return;
   }
   if (data === 'adm_logstats') {
     if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
-    bot.emit('text', { ...query.message, from: query.from, text: '/logstats', chat: query.message.chat });
-    return;
+    fakeMsg(query, '/logstats'); return;
   }
 
   // ── LEADERBOARD pagination ────────────────────────────────────────────────
