@@ -62,7 +62,9 @@ const BotWalletSchema = new mongoose.Schema({
   displayName: { type: String, default: '' },
   balance:     { type: Number, default: 0 },
   totalEarned: { type: Number, default: 0 },  // lifetime coins received
-  claims:      { type: Number, default: 0 }   // successful claims
+  claims:      { type: Number, default: 0 },  // successful claims
+  referredBy:  { type: String, default: '' }, // userId who referred them
+  referrals:   { type: Number, default: 0 }   // how many users they referred
 });
 const BotWallet = mongoose.model('BotWallet', BotWalletSchema);
 
@@ -108,7 +110,8 @@ function log(msg, action, detail, result = 'info') {
 const PendingRefSchema = new mongoose.Schema({
   userId:    { type: String, unique: true },
   ref:       String,
-  createdAt: { type: Date, default: Date.now, expires: 3600 } // auto-expire after 1 h
+  notified:  { type: Boolean, default: false }, // warned at 20h mark
+  createdAt: { type: Date, default: Date.now, expires: 86400 } // auto-expire after 24h
 });
 const PendingRef = mongoose.model('PendingRef', PendingRefSchema);
 
@@ -375,8 +378,9 @@ async function loadSchedules() {
 /* ═══════════════════════════════════
    CUSTOMER COMMANDS
 ═══════════════════════════════════ */
-bot.onText(/^\/start$/, async (msg) => {
-  const chatId = msg.chat.id;
+bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
+  const chatId  = msg.chat.id;
+  const refParam = match && match[1] ? match[1].trim() : null;
   
   // Check if banned
   if (msg.chat.type === 'private') {
@@ -386,9 +390,11 @@ bot.onText(/^\/start$/, async (msg) => {
       return;
     }
     saveUser(msg.from.id);
+    const newUserId = String(msg.from.id);
     // Save name/username so leaderboard always shows real names
+    const existingWallet = await BotWallet.findOne({ userId: newUserId });
     await BotWallet.findOneAndUpdate(
-      { userId: String(msg.from.id) },
+      { userId: newUserId },
       { $set: {
           username:    msg.from.username ? '@' + msg.from.username : '',
           displayName: msg.from.first_name || ''
@@ -396,6 +402,34 @@ bot.onText(/^\/start$/, async (msg) => {
       },
       { upsert: true }
     ).catch(() => {});
+
+    // ── Referral: credit referrer if this is a new user ──────────────────
+    const REFERRAL_REWARD = parseInt(process.env.REFERRAL_COINS) || 100;
+    if (refParam && !existingWallet && refParam !== newUserId) {
+      const referrer = await BotWallet.findOne({ userId: refParam });
+      if (referrer) {
+        // Mark new user as referred
+        await BotWallet.findOneAndUpdate({ userId: newUserId }, { $set: { referredBy: refParam } }).catch(() => {});
+        // Credit referrer
+        await BotWallet.findOneAndUpdate(
+          { userId: refParam },
+          { $inc: { balance: REFERRAL_REWARD, totalEarned: REFERRAL_REWARD, referrals: 1 } }
+        ).catch(() => {});
+        log(msg, 'referral', `referrer=${refParam} reward=${REFERRAL_REWARD}`, 'ok');
+        // Notify referrer
+        const newName = msg.from.first_name || msg.from.username || 'Someone';
+        bot.sendMessage(refParam,
+`╔══════════════════╗
+  🎉  *REFERRAL BONUS!*
+╚══════════════════╝
+
+👤 *${newName}* just joined using your link!
+💰 You earned *${REFERRAL_REWARD}* coins!
+
+Use /wallet to check your balance.`,
+          { parse_mode: 'Markdown' }).catch(() => {});
+      }
+    }
   }
   log(msg, '/start', '', 'info');
   resetSession(chatId);
@@ -419,18 +453,18 @@ bot.onText(/^\/start$/, async (msg) => {
 │ 🎬  All Animations        │
 └─────────────────────┘
 
-💰 Price: *${PRICE_COINS} Coins* per account
-
-┌─────────────────────┐
-│  📌  *HOW TO ORDER*      │
-├─────────────────────┤
-│ 1️⃣  Pay (use /pay)        │
-│ 2️⃣  Get your ref code    │
-│ 3️⃣  Use /claim to go! 🚀 │
-└─────────────────────┘
-
-📟 Type /menu to see all commands`,
-    { parse_mode: 'Markdown' }
+💰 Price: *${PRICE_COINS} Coins* per account`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '💳 Payment Info', callback_data: 'menu_pay' },   { text: '🪙 My Wallet',  callback_data: 'menu_wallet' }],
+          [{ text: '🎮 Claim Account', callback_data: 'menu_claim' }, { text: '🔑 Buy Ref',    callback_data: 'menu_buyref' }],
+          [{ text: '🏆 Leaderboard',  callback_data: 'menu_top' },   { text: '🏅 My Rank',    callback_data: 'menu_rank'   }],
+          [{ text: '📟 Full Menu',    callback_data: 'menu_full' }]
+        ]
+      }
+    }
   );
 });
 
@@ -1079,48 +1113,33 @@ bot.onText(/^\/myid$/, (msg) => {
 
 bot.onText(/^\/menu$/, (msg) => {
   const chatId = msg.chat.id;
-  const admin = isAdmin(msg);
+  const admin  = isAdmin(msg);
   log(msg, '/menu', '', 'info');
+
+  const customerKeyboard = [
+    [{ text: '💳 Payment Info',   callback_data: 'menu_pay'    }, { text: '🪙 My Wallet',    callback_data: 'menu_wallet' }],
+    [{ text: '🎮 Claim Account',  callback_data: 'menu_claim'  }, { text: '🔑 Buy Ref Code',  callback_data: 'menu_buyref' }],
+    [{ text: '💸 Send Coins',     callback_data: 'menu_send'   }, { text: '🪪 My ID',         callback_data: 'menu_myid'   }],
+    [{ text: '🏆 Leaderboard',    callback_data: 'menu_top'    }, { text: '🏅 My Rank',       callback_data: 'menu_rank'   }],
+    [{ text: '🔗 Referral Link',  callback_data: 'menu_ref'    }, { text: '🪪 My ID',          callback_data: 'menu_myid'   }],
+  ];
+
+  const adminKeyboard = admin ? [
+    [{ text: '📊 Stats',           callback_data: 'adm_stats'    }, { text: '💳 All Wallets',  callback_data: 'adm_wallets' }],
+    [{ text: '📋 List Accounts',   callback_data: 'adm_list'     }, { text: '🟡 Pending',      callback_data: 'adm_pending' }],
+    [{ text: '📦 Stock',           callback_data: 'adm_stock'    }, { text: '📈 Log Stats',    callback_data: 'adm_logstats'}],
+  ] : [];
+
   bot.sendMessage(chatId,
 `╔════════════════════╗
   📟  *KALYPO MODS MENU*  📟
 ╚════════════════════╝
 
-👤 *CUSTOMER COMMANDS*
-┌──────────────────────────┐
-│ 🏠 /start       — welcome screen       │
-│ 💳 /pay         — payment info          │
-│ 🪙 /wallet      — check coin balance   │
-│ 💸 /send @u amt — transfer coins       │
-│ 🔑 /buyref      — buy ref code         │
-│ 🎮 /claim       — activate account     │
-│ 📟 /menu        — show this menu       │
-│ 🪪 /myid        — your Telegram ID     │
-│ 🏆 /top         — coin leaderboard     │
-│ 🏅 /rank        — your rank & stats    │
-└──────────────────────────┘${admin ? `
-
-🔐 *ADMIN COMMANDS*
-┌──────────────────────────┐
-│ ➕ /gc @u amt    — give coins           │
-│ ➖ /rc @u amt    — remove coins         │
-│ 🎯 /setbal @u amt — set exact balance  │
-│ 💳 /wallets      — all wallets w/ names│
-│ 🔍 /finduser x   — search by name/@    │
-│ 📋 /list         — all accounts        │
-│ 🟡 /pending      — reserved accounts   │
-│ 📊 /stock        — stock status        │
-│ ✅ /approve <id>  — give ref           │
-│ 🔄 /reset <ref>  — reset account       │
-│ 📢 /broadcast    — DM all users        │
-│ 📅 /schedule     — daily msg           │
-│ 📊 /logs         — activity log        │
-│ 📈 /logstats     — log summary         │
-└──────────────────────────┘
-
-👥 *Users tracked:* ${knownUsers.size}
-🔐 *Admin:* ${admin ? 'Yes ✅' : 'No'}` : ''}`,
-    { parse_mode: 'Markdown' }
+Tap a button or type a command:${admin ? '\n\n🔐 *Admin panel included below*' : ''}`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [...customerKeyboard, ...adminKeyboard] }
+    }
   );
 });
 
@@ -1211,15 +1230,108 @@ bot.onText(/^\/pending$/, async (msg) => {
 });
 
 /* ─────────────────────────────────
-   Inline keyboard (list pagination)
+   Inline keyboard — all button handlers
 ───────────────────────────────── */
 bot.on('callback_query', async (query) => {
   const chatId = query.message.chat.id;
   const msgId  = query.message.message_id;
+  const userId = String(query.from.id);
   const data   = query.data;
   bot.answerCallbackQuery(query.id).catch(() => {});
-  if (!listState[chatId]) return;
 
+  // ── MENU buttons ──────────────────────────────────────────────────────────
+  if (data === 'menu_pay') {
+    bot.emit('text', { ...query.message, from: query.from, text: '/pay', chat: query.message.chat });
+    return;
+  }
+  if (data === 'menu_wallet') {
+    bot.emit('text', { ...query.message, from: query.from, text: '/wallet', chat: query.message.chat });
+    return;
+  }
+  if (data === 'menu_claim') {
+    bot.emit('text', { ...query.message, from: query.from, text: '/claim', chat: query.message.chat });
+    return;
+  }
+  if (data === 'menu_buyref') {
+    bot.emit('text', { ...query.message, from: query.from, text: '/buyref', chat: query.message.chat });
+    return;
+  }
+  if (data === 'menu_top') {
+    bot.emit('text', { ...query.message, from: query.from, text: '/top', chat: query.message.chat });
+    return;
+  }
+  if (data === 'menu_rank') {
+    bot.emit('text', { ...query.message, from: query.from, text: '/rank', chat: query.message.chat });
+    return;
+  }
+  if (data === 'menu_myid') {
+    bot.emit('text', { ...query.message, from: query.from, text: '/myid', chat: query.message.chat });
+    return;
+  }
+  if (data === 'menu_send') {
+    bot.sendMessage(chatId, '💸 *Send Coins*\n\nUsage: `/send @username 100`\nOr: `/send userId 100`\n\nMinimum: 10 coins · 30s cooldown between transfers', { parse_mode: 'Markdown' });
+    return;
+  }
+  if (data === 'menu_ref') {
+    bot.emit('text', { ...query.message, from: query.from, text: '/referral', chat: query.message.chat });
+    return;
+  }
+  if (data === 'menu_full') {
+    bot.emit('text', { ...query.message, from: query.from, text: '/menu', chat: query.message.chat });
+    return;
+  }
+
+  // ── ADMIN panel buttons ───────────────────────────────────────────────────
+  if (data === 'adm_stats') {
+    if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
+    bot.emit('text', { ...query.message, from: query.from, text: '/stats', chat: query.message.chat });
+    return;
+  }
+  if (data === 'adm_wallets') {
+    if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
+    bot.emit('text', { ...query.message, from: query.from, text: '/wallets', chat: query.message.chat });
+    return;
+  }
+  if (data === 'adm_list') {
+    if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
+    bot.emit('text', { ...query.message, from: query.from, text: '/list', chat: query.message.chat });
+    return;
+  }
+  if (data === 'adm_pending') {
+    if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
+    bot.emit('text', { ...query.message, from: query.from, text: '/pending', chat: query.message.chat });
+    return;
+  }
+  if (data === 'adm_stock') {
+    if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
+    bot.emit('text', { ...query.message, from: query.from, text: '/stock', chat: query.message.chat });
+    return;
+  }
+  if (data === 'adm_logstats') {
+    if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
+    bot.emit('text', { ...query.message, from: query.from, text: '/logstats', chat: query.message.chat });
+    return;
+  }
+
+  // ── LEADERBOARD pagination ────────────────────────────────────────────────
+  if (data.startsWith('top_')) {
+    const parts = data.split('_');
+    const mode  = parts[1];
+    const page  = parseInt(parts[2]) || 0;
+    try {
+      const lb = await buildLeaderboard(mode, page);
+      if (!lb) return;
+      bot.editMessageText(lb.text, {
+        chat_id: chatId, message_id: msgId,
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: lb.keyboard }
+      }).catch(() => {});
+    } catch(e) {}
+    return;
+  }
+
+  // ── LIST pagination (existing) ────────────────────────────────────────────
+  if (!listState[chatId]) return;
   let { accounts, page, filter } = listState[chatId];
 
   if (data === 'list_next') page++;
@@ -1374,34 +1486,56 @@ const MEDALS = ['🥇','🥈','🥉','4️⃣','5️⃣','6️⃣','7️⃣','8�
 
 // /top — public leaderboard (top coin holders)
 // /top claims — top claimers
+async function buildLeaderboard(mode, page) {
+  const sortField = mode === 'claims' ? { claims: -1, balance: -1 } : { balance: -1, claims: -1 };
+  const perPage   = 10;
+  const skip      = page * perPage;
+  const [top, total] = await Promise.all([
+    BotWallet.find().sort(sortField).skip(skip).limit(perPage).lean(),
+    BotWallet.countDocuments()
+  ]);
+  if (!top.length) return null;
+
+  const totalPages = Math.ceil(total / perPage);
+  const title      = mode === 'claims' ? '🏆 TOP CLAIMERS' : '💰 TOP COIN HOLDERS';
+  let text = `╔════════════════════╗\n  ${title}  (Page ${page+1}/${totalPages})\n╚════════════════════╝\n\n`;
+
+  top.forEach((w, i) => {
+    const rank   = skip + i + 1;
+    const medal  = MEDALS[i] || `${rank}.`;
+    const name   = w.displayName || (w.username ? w.username.replace('@','') : null) || `User ${String(w.userId).slice(-4)}`;
+    const handle = w.username ? ` (${w.username})` : '';
+    const value  = mode === 'claims' ? `*${w.claims || 0}* claims` : `*${w.balance || 0}* coins`;
+    text += `${medal} *${name}*${handle}\n   ${value}\n\n`;
+  });
+  text += `_${total} total users_`;
+
+  const nav = [];
+  if (page > 0)               nav.push({ text: '◀️ Prev', callback_data: `top_${mode}_${page-1}` });
+  if (page + 1 < totalPages)  nav.push({ text: 'Next ▶️', callback_data: `top_${mode}_${page+1}` });
+
+  const modeSwitch = mode === 'coins'
+    ? [{ text: '🏆 Switch to Claims', callback_data: `top_claims_0` }]
+    : [{ text: '💰 Switch to Coins',  callback_data: `top_coins_0`  }];
+
+  const keyboard = [];
+  if (nav.length)   keyboard.push(nav);
+  keyboard.push(modeSwitch);
+
+  return { text, keyboard };
+}
+
 bot.onText(/^\/top(?: (coins|claims))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
-  const mode = (match[1] || 'coins').toLowerCase();
+  const mode   = (match[1] || 'coins').toLowerCase();
   log(msg, '/top', mode, 'info');
   const cdT = checkCooldown(String(msg.from.id), 'top', 20);
   if (!cdT.ok) return bot.sendMessage(chatId, '⏳ Check the leaderboard again in *'+cdT.remaining+'s*.', { parse_mode: 'Markdown' });
 
   try {
-    const sortField = mode === 'claims' ? { claims: -1 } : { balance: -1 };
-    const top = await BotWallet.find().sort(sortField).limit(10).catch(() => []);
-
-    if (!top.length) return bot.sendMessage(chatId, '📭 No leaderboard data yet.');
-
-    const title = mode === 'claims' ? '🏆 TOP CLAIMERS' : '💰 TOP COIN HOLDERS';
-    let text = `╔════════════════════╗\n  ${title}\n╚════════════════════╝\n\n`;
-
-    top.forEach((w, i) => {
-      const medal  = MEDALS[i] || `${i+1}.`;
-      const name   = w.displayName || w.username || `User ${w.userId.slice(-4)}`;
-      const handle = w.username ? ` (${w.username})` : '';
-      const value  = mode === 'claims'
-        ? `*${w.claims || 0}* claims`
-        : `*${w.balance}* coins`;
-      text += `${medal} ${name}${handle}\n   ${value}\n\n`;
-    });
-
-    text += `_Updated live · /top claims for claim ranks_`;
-    bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+    const lb = await buildLeaderboard(mode, 0);
+    if (!lb) return bot.sendMessage(chatId, '📭 No leaderboard data yet.');
+    bot.sendMessage(chatId, lb.text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: lb.keyboard } });
   } catch(e) {
     bot.sendMessage(chatId, '❌ Error loading leaderboard.');
   }
@@ -1813,6 +1947,240 @@ Try again with /claim or contact admin.`,
     resetSession(chatId);
   }
 });
+
+/* ═══════════════════════════════════
+   /referral — get personal referral link
+═══════════════════════════════════ */
+bot.onText(/^\/referral$/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = String(msg.from.id);
+  log(msg, '/referral', '', 'info');
+
+  const w = await getUserWallet(userId, msg.from);
+  if (!w) return bot.sendMessage(chatId, '❌ Use /start first.');
+
+  const botInfo  = await bot.getMe();
+  const refLink  = `https://t.me/${botInfo.username}?start=${userId}`;
+  const reward   = parseInt(process.env.REFERRAL_COINS) || 100;
+
+  bot.sendMessage(chatId,
+`╔══════════════════════╗
+  🔗  *YOUR REFERRAL LINK*
+╚══════════════════════╝
+
+Share this link with friends:
+${refLink}
+
+💰 You earn *${reward} coins* for every person who joins!
+👥 Total referrals: *${w.referrals || 0}*
+💳 Your balance: *${w.balance}* coins
+
+_Your friend must tap the link and press Start._`,
+    { parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [[{ text: '📤 Share Link', switch_inline_query: `Join Kalypo Mods and get bonus coins! ${refLink}` }]] }
+    });
+});
+
+/* ═══════════════════════════════════
+   REF EXPIRY WATCHDOG
+   Warns user at 20h, refunds coins if ref expires at 24h
+═══════════════════════════════════ */
+const WARN_AFTER_MS   = 20 * 60 * 60 * 1000; // 20h — send warning
+const EXPIRE_AFTER_MS = 24 * 60 * 60 * 1000; // 24h — refund and release
+
+setInterval(async () => {
+  try {
+    const now     = Date.now();
+    const pending = await PendingRef.find({}).lean();
+
+    for (const p of pending) {
+      const age = now - new Date(p.createdAt).getTime();
+
+      // ── Warn at 20h ──────────────────────────────────────────────────────
+      if (age >= WARN_AFTER_MS && !p.notified) {
+        await PendingRef.findOneAndUpdate({ userId: p.userId }, { $set: { notified: true } }).catch(() => {});
+        const price = parseInt(PRICE_COINS);
+        bot.sendMessage(p.userId,
+`⚠️ *Ref Code Expiring Soon!*
+
+🔑 Your ref: \`${p.ref}\`
+
+You have *~4 hours* to use /claim before your ref expires and *${price} coins are refunded*.
+
+➡️ Use /claim now to activate your account!`,
+          { parse_mode: 'Markdown' }).catch(() => {});
+      }
+
+      // ── Expire at 24h — refund coins ─────────────────────────────────────
+      if (age >= EXPIRE_AFTER_MS) {
+        const price = parseInt(PRICE_COINS);
+        await PendingRef.deleteOne({ userId: p.userId }).catch(() => {});
+        await BotWallet.findOneAndUpdate(
+          { userId: p.userId },
+          { $inc: { balance: price, totalEarned: price } }
+        ).catch(() => {});
+        bot.sendMessage(p.userId,
+`⏰ *Ref Code Expired*
+
+Your ref \`${p.ref}\` has expired after 24 hours.
+💰 *${price} coins have been refunded* to your wallet.
+
+Use /buyref to get a new ref code anytime.`,
+          { parse_mode: 'Markdown' }).catch(() => {});
+        log({ from: { id: p.userId, username: '', first_name: '' } }, 'ref_expired', `ref=${p.ref} refunded=${price}`, 'info');
+      }
+    }
+  } catch(e) {
+    console.error('Expiry watchdog error:', e.message);
+  }
+}, 30 * 60 * 1000); // check every 30 minutes
+
+/* ═══════════════════════════════════
+   LOW STOCK ALERT
+   DMs admin when available accounts drop below threshold
+═══════════════════════════════════ */
+const LOW_STOCK_THRESHOLD = parseInt(process.env.LOW_STOCK_THRESHOLD) || 5;
+let lastStockCount = Infinity; // track previous count to avoid spam
+
+async function checkStockLevel() {
+  try {
+    const accs = await apiAdminAccounts();
+    const available = accs.filter(a => a.status === 'AVAILABLE').length;
+
+    // Only alert when count drops to/below threshold (not repeatedly)
+    if (available <= LOW_STOCK_THRESHOLD && available < lastStockCount) {
+      const icon = available === 0 ? '🚨' : '⚠️';
+      const msg  = available === 0
+        ? `🚨 *OUT OF STOCK!*\n\nNo accounts available. Users cannot buy right now!\n\nAdd stock immediately.`
+        : `⚠️ *Low Stock Alert*\n\nOnly *${available}* account${available === 1 ? '' : 's'} remaining!\n\nConsider adding more stock soon.`;
+
+      for (const adminId of ADMIN_IDS) {
+        bot.sendMessage(adminId, msg, { parse_mode: 'Markdown' }).catch(() => {});
+      }
+    }
+    lastStockCount = available;
+  } catch(e) {
+    // API may be down — silent fail
+  }
+}
+
+// Check stock every 15 minutes
+setInterval(checkStockLevel, 15 * 60 * 1000);
+
+/* ═══════════════════════════════════
+   /stats — admin dashboard
+═══════════════════════════════════ */
+bot.onText(/^\/stats$/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  log(msg, '/stats', '', 'info');
+  bot.sendMessage(chatId, '🔄 Building dashboard...');
+
+  try {
+    const [
+      totalUsers,
+      totalWallets,
+      coinsData,
+      topHolder,
+      topClaimer,
+      topReferrer,
+      recentLogs,
+      claimsToday,
+      pendingRefs,
+      stockData
+    ] = await Promise.all([
+      BotUser.countDocuments(),
+      BotWallet.countDocuments(),
+      BotWallet.aggregate([{ $group: { _id: null, total: { $sum: '$balance' }, totalEarned: { $sum: '$totalEarned' } } }]),
+      BotWallet.findOne().sort({ balance: -1 }).lean(),
+      BotWallet.findOne().sort({ claims: -1 }).lean(),
+      BotWallet.findOne().sort({ referrals: -1 }).lean(),
+      CommandLog.find().sort({ _id: -1 }).limit(50).lean(),
+      ActivityLog.countDocuments({ action: 'claim', result: 'ok', timestamp: { $gte: new Date(Date.now() - 86400000) } }).catch(() => 0),
+      PendingRef.countDocuments(),
+      apiAdminAccounts().then(a => ({ available: a.filter(x => x.status === 'AVAILABLE').length, total: a.length })).catch(() => ({ available: '?', total: '?' }))
+    ]);
+
+    const totalCoins   = coinsData[0]?.total || 0;
+    const totalEarned  = coinsData[0]?.totalEarned || 0;
+    const richName     = topHolder ? (topHolder.displayName || topHolder.username || `User ${String(topHolder.userId).slice(-4)}`) : 'N/A';
+    const claimerName  = topClaimer ? (topClaimer.displayName || topClaimer.username || `User ${String(topClaimer.userId).slice(-4)}`) : 'N/A';
+
+    // Count commands in recent logs
+    const cmdCounts = {};
+    recentLogs.forEach(l => { cmdCounts[l.command] = (cmdCounts[l.command] || 0) + 1; });
+    const topCmds = Object.entries(cmdCounts).sort((a,b) => b[1]-a[1]).slice(0,3).map(([c,n]) => `/${c} ×${n}`).join('  ');
+
+    const refName = topReferrer ? (topReferrer.displayName || topReferrer.username || `User ${String(topReferrer.userId).slice(-4)}`) : 'N/A';
+    const now = new Date();
+    bot.sendMessage(chatId,
+`╔══════════════════════╗
+  📊  *STATS DASHBOARD*
+╚══════════════════════╝
+
+👥 *Users*
+├ Registered: *${totalUsers}*
+├ Wallets: *${totalWallets}*
+└ Pending refs: *${pendingRefs}*
+
+💰 *Coins*
+├ In circulation: *${totalCoins.toLocaleString()}*
+├ All-time issued: *${totalEarned.toLocaleString()}*
+└ Avg per user: *${totalWallets ? Math.round(totalCoins/totalWallets) : 0}*
+
+📦 *Stock*
+├ Available accounts: *${stockData.available}* / ${stockData.total}
+└ ${stockData.available <= LOW_STOCK_THRESHOLD ? '⚠️ LOW STOCK!' : '✅ Stock OK'}
+
+🏆 *Top Users*
+├ 💰 Richest: *${richName}* (${topHolder?.balance || 0} coins)
+├ 🎮 Most Claims: *${claimerName}* (${topClaimer?.claims || 0})
+└ 🔗 Top Referrer: *${refName}* (${topReferrer?.referrals || 0} refs)
+
+📈 *Activity*
+├ Claims today: *${claimsToday}*
+└ Top commands: ${topCmds || 'N/A'}
+
+🕐 _${now.toUTCString()}_`,
+      { parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [
+          [{ text: '💳 All Wallets', callback_data: 'adm_wallets' }, { text: '📋 Accounts', callback_data: 'adm_list' }],
+          [{ text: '📊 Stock',       callback_data: 'adm_stock'   }, { text: '📈 Log Stats', callback_data: 'adm_logstats' }]
+        ]}
+      });
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Error building stats: ' + e.message);
+  }
+});
+
+/* ═══════════════════════════════════
+   /dm — send a DM to any user (admin)
+═══════════════════════════════════ */
+bot.onText(/^\/dm (@?\S+) (.+)$/s, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+
+  const { userId, targetName, err } = await resolveTarget(msg, match[1]);
+  if (err) return bot.sendMessage(chatId, '❌ ' + err);
+  const message = match[2].trim();
+
+  try {
+    await bot.sendMessage(userId,
+`📩 *Message from Admin*\n\n${message}`,
+      { parse_mode: 'Markdown' });
+    log(msg, '/dm', `to=${userId} msg="${message.substring(0,40)}"`, 'ok');
+    bot.sendMessage(chatId,
+`✅ *DM Sent!*
+
+👤 To: ${targetName}
+🆔 ID: \`${userId}\`
+📩 _"${message.substring(0,60)}${message.length > 60 ? '…' : ''}"_`,
+      { parse_mode: 'Markdown' });
+  } catch(e) {
+    bot.sendMessage(chatId, `❌ Could not DM that user. They may not have started the bot.\n\`${e.message}\``, { parse_mode: 'Markdown' });
+  }
+});
+
 
 /* ═══════════════════════════════════
    STARTUP
