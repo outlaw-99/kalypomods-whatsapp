@@ -16,7 +16,10 @@ const BOT_TOKEN   = process.env.BOT_TOKEN  || '8645097113:AAHhYO7AFy6dWLZVqVIUXi
 const SERVER_URL  = process.env.SERVER_URL || 'https://kalypo-mods.onrender.com';
 const ADMIN_KEY   = process.env.ADMIN_KEY  || '990';
 const ADMIN_IDS   = (process.env.ADMIN_TELEGRAM_IDS || '7564594071').split(',').map(s => s.trim()).filter(Boolean);
-const PRICE_COINS = process.env.PRICE_COINS || '500';
+const PRICE_COINS       = process.env.PRICE_COINS || '500';
+const STARS_PER_PACK   = parseInt(process.env.STARS_PER_PACK)   || 100;  // Telegram Stars per purchase
+const COINS_PER_PACK   = parseInt(process.env.COINS_PER_PACK)   || 500;  // Coins awarded per Stars payment
+const REFERRAL_STARS   = parseInt(process.env.REFERRAL_STARS)   || 25;   // Stars bonus for referrer when referee pays
 const MONGO_URI   = process.env.MONGODB_URI || 'mongodb+srv://rm1402678_db_user:52q7DBT4rJAE786p@cluster0.t0auzso.mongodb.net/kalypo?appName=Cluster0';
 const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || '-1003787424518';
 
@@ -470,26 +473,154 @@ Use /wallet to check your balance.`,
 
 bot.onText(/^\/help$/, (msg) => bot.emit('text', { ...msg, text: '/start' }));
 
-bot.onText(/^\/pay$/, (msg) => {
+bot.onText(/^\/pay$/, async (msg) => {
+  const chatId = msg.chat.id;
   log(msg, '/pay', '', 'info');
-  bot.sendMessage(msg.chat.id,
+
+  // Show options: Telegram Stars (instant) or manual proof
+  bot.sendMessage(chatId,
 `╔══════════════════╗
    💳  *HOW TO PAY*  💳
 ╚══════════════════╝
 
-Send *${PRICE_COINS} Coins* worth of payment
-via your preferred method.
+Choose your payment method:
 
-📸 Send *proof of payment* to the admin here.
+⭐ *Telegram Stars* — Instant & automatic
+   Pay *${STARS_PER_PACK} Stars* → get *${COINS_PER_PACK} coins* immediately
+   No waiting, no admin needed!
 
-┌────────────────────┐
-│ ✅ Admin confirms     │
-│ 🔑 You get a ref code │
-│ 🎮 Use /claim         │
-└────────────────────┘`,
-    { parse_mode: 'Markdown' }
+📸 *Manual Payment* — Send proof to admin
+   Admin confirms → you get a ref code
+   Use /claim to activate`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: `⭐ Pay ${STARS_PER_PACK} Stars (Instant)`, callback_data: 'pay_stars' }],
+          [{ text: '📸 Manual Payment (Send Proof)',           callback_data: 'pay_manual' }]
+        ]
+      }
+    }
   );
 });
+
+/* ═══════════════════════════════════
+   TELEGRAM STARS PAYMENT FLOW
+═══════════════════════════════════ */
+
+// Send invoice when user taps Pay Stars button
+async function sendStarsInvoice(chatId, userId) {
+  try {
+    await bot.sendInvoice(
+      chatId,
+      'Kalypo Mods — Coin Pack',                          // title
+      `Get ${COINS_PER_PACK} coins instantly! Use them to buy CPM2 premium accounts via /buyref.`,
+      JSON.stringify({ userId: String(userId), coins: COINS_PER_PACK }),  // payload
+      'XTR',                                              // currency = Telegram Stars
+      [{ label: `${COINS_PER_PACK} Coins`, amount: STARS_PER_PACK }],    // prices
+      {
+        photo_url: 'https://telegra.ph/file/a8b2c6f4d8e1a3c7b5d9f.jpg',  // optional banner
+        need_name: false,
+        need_email: false,
+        is_flexible: false,
+        protect_content: false
+      }
+    );
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Could not open payment. Try again or contact admin.');
+    console.error('Invoice error:', e.message);
+  }
+}
+
+// Pre-checkout: approve all valid payments
+bot.on('pre_checkout_query', async (query) => {
+  try {
+    await bot.answerPreCheckoutQuery(query.id, true);
+  } catch(e) {
+    await bot.answerPreCheckoutQuery(query.id, false, 'Payment could not be processed. Please try again.').catch(() => {});
+  }
+});
+
+// Successful payment: credit coins + notify referrer in Stars
+bot.on('message', async (msg) => {
+  if (!msg.successful_payment) return;
+  const chatId  = msg.chat.id;
+  const payment = msg.successful_payment;
+
+  let payload;
+  try { payload = JSON.parse(payment.invoice_payload); } catch(e) { return; }
+
+  const userId = payload.userId;
+  const coins  = payload.coins || COINS_PER_PACK;
+  const stars  = payment.total_amount;
+
+  try {
+    // Credit buyer
+    const w = await BotWallet.findOneAndUpdate(
+      { userId: String(userId) },
+      { $inc: { balance: coins, totalEarned: coins } },
+      { upsert: true, new: true }
+    );
+
+    log(msg, 'stars_payment', `userId=${userId} stars=${stars} coins=${coins}`, 'ok');
+
+    bot.sendMessage(chatId,
+`╔══════════════════╗
+  ⭐  *PAYMENT SUCCESS!*
+╚══════════════════╝
+
+✅ *${coins} coins* added to your wallet!
+💳 New Balance: *${w.balance}* coins
+
+➡️ Use /buyref to get your ref code
+🎮 Then /claim to activate your account`,
+      { parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '🔑 Buy Ref Now', callback_data: 'menu_buyref' }]] }
+      });
+
+    // ── Referral bonus in Stars ───────────────────────────────────────────
+    if (REFERRAL_STARS > 0) {
+      const buyerWallet = await BotWallet.findOne({ userId: String(userId) }).lean();
+      if (buyerWallet && buyerWallet.referredBy) {
+        const referrerId = buyerWallet.referredBy;
+        // Credit referrer with coin equivalent bonus
+        const refBonus = Math.round(coins * 0.1); // 10% coin bonus
+        await BotWallet.findOneAndUpdate(
+          { userId: referrerId },
+          { $inc: { balance: refBonus, totalEarned: refBonus } }
+        ).catch(() => {});
+        const buyerName = msg.from.first_name || msg.from.username || 'Someone';
+        bot.sendMessage(referrerId,
+`╔══════════════════╗
+  💰  *REFERRAL EARNING!*
+╚══════════════════╝
+
+🎉 *${buyerName}* just bought a coin pack!
+⭐ You earned *${refBonus} bonus coins* (10% of their purchase)!
+
+💳 Use /wallet to check your balance.`,
+          { parse_mode: 'Markdown' }).catch(() => {});
+        log(msg, 'referral_stars_bonus', `referrer=${referrerId} buyer=${userId} bonus=${refBonus}`, 'ok');
+      }
+    }
+
+    // Notify admin
+    for (const adminId of ADMIN_IDS) {
+      const name = msg.from.first_name || msg.from.username || userId;
+      bot.sendMessage(adminId,
+`⭐ *Stars Payment Received*
+
+👤 User: ${name} (\`${userId}\`)
+⭐ Stars paid: *${stars}*
+💰 Coins credited: *${coins}*`,
+        { parse_mode: 'Markdown' }).catch(() => {});
+    }
+  } catch(e) {
+    console.error('Payment processing error:', e.message);
+    bot.sendMessage(chatId, '⚠️ Payment received but there was an error crediting your coins. Please contact admin with your payment ID: ' + payment.telegram_payment_charge_id);
+  }
+});
+
 
 bot.onText(/^\/check (.+)$/, async (msg, match) => {
   const chatId = msg.chat.id;
@@ -1265,6 +1396,28 @@ bot.on('callback_query', async (query) => {
   if (data === 'menu_full')   { fakeMsg(query, '/menu');     return; }
   if (data === 'menu_send') {
     bot.sendMessage(chatId, '💸 *Send Coins*\n\nUsage: `/send @username 100`\nOr: `/send userId 100`\n\nMinimum: 10 coins · 30s cooldown between transfers', { parse_mode: 'Markdown' });
+    return;
+  }
+  if (data === 'pay_stars') {
+    await sendStarsInvoice(chatId, userId);
+    return;
+  }
+  if (data === 'pay_manual') {
+    bot.sendMessage(chatId,
+`📸 *Manual Payment*
+
+Send proof of payment to admin and wait for confirmation.
+
+┌────────────────────┐
+│ ✅ Admin confirms     │
+│ 🔑 You get a ref code │
+│ 🎮 Use /claim         │
+└────────────────────┘
+
+_Or tap below to pay instantly with Stars:_`,
+      { parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '⭐ Pay ' + STARS_PER_PACK + ' Stars Instead', callback_data: 'pay_stars' }]] }
+      });
     return;
   }
 
