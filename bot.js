@@ -20,12 +20,12 @@ const PRICE_COINS      = process.env.PRICE_COINS || '500';
 const COINS_PER_PACK   = parseInt(process.env.COINS_PER_PACK) || 500;
 const STARS_PRICE      = parseInt(process.env.STARS_PRICE)    || 100;  // Telegram Stars to charge
 
-// Bulk ref packages — [qty, coinPrice, starsPrice, label]
-const BULK_PACKAGES = [
-  { id: 'x1',  qty: 1, coins: 500,  stars: 100, label: 'Starter',  badge: '🥉' },
-  { id: 'x2',  qty: 2, coins: 900,  stars: 180, label: 'Double',   badge: '🥈' },
-  { id: 'x3',  qty: 3, coins: 1200, stars: 250, label: 'Triple',   badge: '🥇' },
-  { id: 'x5',  qty: 5, coins: 1800, stars: 380, label: 'Mega',     badge: '💎' },
+// Coin packages — users buy coins with Stars (bulk = bonus coins)
+const COIN_PACKAGES = [
+  { id: 'c1', stars: 100, coins: 500,  bonus: 0,   label: 'Starter', badge: '🥉' },
+  { id: 'c2', stars: 180, coins: 1100, bonus: 100, label: 'Double',  badge: '🥈' },
+  { id: 'c3', stars: 250, coins: 1800, bonus: 300, label: 'Triple',  badge: '🥇' },
+  { id: 'c5', stars: 380, coins: 3200, bonus: 700, label: 'Mega',    badge: '💎' },
 ];
 const MONGO_URI   = process.env.MONGODB_URI || 'mongodb+srv://rm1402678_db_user:52q7DBT4rJAE786p@cluster0.t0auzso.mongodb.net/kalypo?appName=Cluster0';
 const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || '-1003787424518';
@@ -483,43 +483,50 @@ bot.onText(/^\/help$/, (msg) => bot.emit('text', { ...msg, text: '/start' }));
 bot.onText(/^\/pay$/, async (msg) => {
   const chatId = msg.chat.id;
   log(msg, '/pay', '', 'info');
-  bot.sendMessage(chatId,
-`╔══════════════════╗
-   💳  *HOW TO PAY*  💳
-╚══════════════════╝
-
-⭐ *Telegram Stars* — Instant & automatic
-   Pay *${STARS_PRICE} Stars* → get *${COINS_PER_PACK} coins*
-   No card needed, pay right inside Telegram!
-
-📸 *Manual* — Send proof to admin
-   Admin credits your coins manually`,
-    {
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '⭐ Pay ' + STARS_PRICE + ' Stars (Instant)', callback_data: 'pay_stars' }],
-          [{ text: '📸 Manual Payment',                           callback_data: 'pay_manual' }]
-        ]
-      }
-    }
-  );
+  await showCoinShop(chatId);
 });
+
+async function showCoinShop(chatId) {
+  let text = `╔═══════════════════════╗\n  🪙  *BUY COINS*\n╚═══════════════════════╝\n\n`;
+  text += `Use coins to buy ref codes via /buyref.\n`;
+  text += `1 ref = *${PRICE_COINS} coins*\n\n`;
+  text += `*⭐ Stars Packages:*\n\n`;
+
+  const keyboard = [];
+  for (const pkg of COIN_PACKAGES) {
+    const perStar = (pkg.coins / pkg.stars).toFixed(1);
+    text += `${pkg.badge} *${pkg.label}*\n`;
+    text += `   ⭐ ${pkg.stars} Stars → 🪙 *${pkg.coins} coins*`;
+    if (pkg.bonus > 0) text += ` _(+${pkg.bonus} bonus!)_`;
+    text += `\n   📊 ${perStar} coins/star\n\n`;
+    keyboard.push([{ text: `${pkg.badge} ${pkg.label} — ⭐${pkg.stars} → 🪙${pkg.coins}${pkg.bonus > 0 ? ' (+'+pkg.bonus+' bonus)' : ''}`, callback_data: 'buy_coins_' + pkg.id }]);
+  }
+  keyboard.push([{ text: '📸 Manual Payment', callback_data: 'pay_manual' }]);
+
+  bot.sendMessage(chatId, text, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: keyboard }
+  });
+}
+
 
 /* ═══════════════════════════════════
    TELEGRAM STARS PAYMENT FLOW
 ═══════════════════════════════════ */
-async function sendStarsInvoice(chatId, from) {
-  const payload = JSON.stringify({ userId: String(from.id), coins: COINS_PER_PACK });
+async function sendCoinInvoice(chatId, from, pkgId) {
+  const pkg = COIN_PACKAGES.find(p => p.id === pkgId);
+  if (!pkg) return bot.sendMessage(chatId, '❌ Invalid package.');
+
+  const payload = JSON.stringify({ userId: String(from.id), pkgId, coins: pkg.coins });
   try {
     await bot.sendInvoice(
       chatId,
-      'Kalypo Mods — Coin Pack',
-      'Get ' + COINS_PER_PACK + ' coins instantly. Use /buyref after payment.',
+      'Kalypo Mods — ' + pkg.label + ' Coin Pack',
+      'Get ' + pkg.coins + ' coins instantly!' + (pkg.bonus > 0 ? ' Includes ' + pkg.bonus + ' bonus coins!' : '') + ' Use /buyref after payment.',
       payload,
-      '',       // MUST be empty string for Telegram Stars
-      'XTR',    // MUST be XTR for Telegram Stars
-      [{ label: COINS_PER_PACK + ' Coins', amount: STARS_PRICE }]
+      '',
+      'XTR',
+      [{ label: pkg.coins + ' Coins', amount: pkg.stars }]
     );
   } catch(e) {
     console.error('sendInvoice error:', e.message);
@@ -557,28 +564,33 @@ bot.on('message', async (msg) => {
   const stars  = payment.total_amount; // number of Stars paid
 
   try {
+    // Look up package for bonus display
+    const pkgId      = payload.pkgId;
+    const pkg        = pkgId ? COIN_PACKAGES.find(p => p.id === pkgId) : null;
+    const totalCoins = pkg ? pkg.coins : (payload.coins || COINS_PER_PACK);
+
     const w = await BotWallet.findOneAndUpdate(
       { userId: String(userId) },
-      { $inc: { balance: coins, totalEarned: coins } },
+      { $inc: { balance: totalCoins, totalEarned: totalCoins } },
       { upsert: true, new: true }
     );
 
-    log(msg, 'card_payment', 'userId=' + userId + ' stars=' + stars + ' coins=' + coins, 'ok');
+    log(msg, 'stars_payment', 'userId=' + userId + ' stars=' + stars + ' coins=' + totalCoins + (pkg ? ' pkg='+pkgId : ''), 'ok');
 
+    const bonusLine = pkg && pkg.bonus > 0 ? '\n🎁 Includes *' + pkg.bonus + '* bonus coins!' : '';
     bot.sendMessage(chatId,
 `╔══════════════════╗
-  💳  *PAYMENT SUCCESS!*
+  ⭐  *PAYMENT SUCCESS!*
 ╚══════════════════╝
 
-✅ *${coins} coins* added to your wallet!
+✅ *${totalCoins} coins* added to your wallet!${bonusLine}
 💳 New Balance: *${w.balance}* coins
 
-➡️ Use /buyref to get your ref code
+➡️ Use /buyref to spend coins on a ref
 🎮 Then /claim to activate your account`,
       { parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [[{ text: '🔑 Buy Ref Now', callback_data: 'menu_buyref' }]] }
+        reply_markup: { inline_keyboard: [[{ text: '🔑 Buy Ref Code', callback_data: 'menu_buyref' }]] }
       });
-
 
     // Referral bonus — 10% coins to whoever referred this user
     const buyerWallet = await BotWallet.findOne({ userId: String(userId) }).lean();
@@ -1064,75 +1076,17 @@ bot.onText(/^\/removecoins (\d+) (\d+)$/, async (msg, match) => {
    If /claim fails later the coins are refunded automatically.
 ═══════════════════════════════════ */
 /* ═══════════════════════════════════
-   BULK PACKAGE PURCHASE FLOW
+   /buyref — spend coins to get a ref code
 ═══════════════════════════════════ */
+bot.onText(/^\/buyref$/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id;
+  const price  = parseInt(PRICE_COINS);
 
-// Show the shop with all packages
-async function showBulkShop(chatId, userId) {
-  const w = await getUserWallet(userId);
-  const bal = w ? w.balance : 0;
+  const cdB = checkCooldown(String(userId), 'buyref', 30);
+  if (!cdB.ok) return bot.sendMessage(chatId, '⏳ *Cooldown!* Try again in *'+cdB.remaining+'s*.', { parse_mode: 'Markdown' });
 
-  // Check stock first
-  let stockCount = 0;
-  try {
-    const accs = await apiAdminAccounts();
-    stockCount = accs.filter(a => a.status === 'AVAILABLE').length;
-  } catch(e) {}
-
-  if (stockCount === 0) {
-    return bot.sendMessage(chatId,
-`❌ *No stock available right now.*
-
-Check back soon or contact admin.`,
-      { parse_mode: 'Markdown' });
-  }
-
-  let shopText = `╔═══════════════════════╗
-  🛒  *REF CODE SHOP*
-╚═══════════════════════╝
-
-`;
-  shopText += `💳 Your balance: *${bal} coins*
-`;
-  shopText += `📦 Stock available: *${stockCount}*
-
-`;
-  shopText += `*Choose a package:*
-
-`;
-
-  const keyboard = [];
-  for (const pkg of BULK_PACKAGES) {
-    if (pkg.qty > stockCount) continue; // hide if not enough stock
-    const perRef   = Math.round(pkg.coins / pkg.qty);
-    const saving   = (pkg.qty * 500) - pkg.coins;
-    const canAfford = bal >= pkg.coins ? '✅' : '❌';
-    shopText += `${pkg.badge} *${pkg.label}* — ${pkg.qty} ref${pkg.qty > 1 ? 's' : ''}
-`;
-    shopText += `   💰 ${pkg.coins} coins (${perRef}/ref)`;
-    if (saving > 0) shopText += `  🏷️ Save ${saving}!`;
-    shopText += `
-   ⭐ ${pkg.stars} Stars
-   ${canAfford} ${bal >= pkg.coins ? 'You can afford this' : 'Need ' + (pkg.coins - bal) + ' more coins'}
-
-`;
-    keyboard.push([
-      { text: `${pkg.badge} ${pkg.label} — 💰${pkg.coins} coins`, callback_data: `bulk_coins_${pkg.id}` },
-      { text: `⭐ ${pkg.stars} Stars`, callback_data: `bulk_stars_${pkg.id}` }
-    ]);
-  }
-
-  bot.sendMessage(chatId, shopText, {
-    parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: keyboard }
-  });
-}
-
-// Process a bulk purchase with coins
-async function processBulkCoins(chatId, userId, pkgId, msg) {
-  const pkg = BULK_PACKAGES.find(p => p.id === pkgId);
-  if (!pkg) return bot.sendMessage(chatId, '❌ Invalid package.');
-
+  // Already has a pending ref?
   const existing = await PendingRef.findOne({ userId: String(userId) }).catch(() => null);
   if (existing) {
     return bot.sendMessage(chatId,
@@ -1140,107 +1094,60 @@ async function processBulkCoins(chatId, userId, pkgId, msg) {
 
 🔑 \`${existing.ref}\`
 
-➡️ Use /claim first before buying more.`,
+➡️ Use /claim to activate it first.`,
       { parse_mode: 'Markdown' });
   }
 
-  const w = await getUserWallet(userId);
-  if (!w || w.balance < pkg.coins) {
+  const w = await getUserWallet(userId, msg.from);
+  if (!w || w.balance < price) {
     return bot.sendMessage(chatId,
 `❌ *Insufficient coins!*
 
 💰 Your balance: *${w ? w.balance : 0}* coins
-💵 Required: *${pkg.coins}* coins
-📉 Need: *${pkg.coins - (w ? w.balance : 0)}* more coins
+💵 Required: *${price}* coins
+📉 Need: *${price - (w ? w.balance : 0)}* more
 
-Use /pay to top up.`,
-      { parse_mode: 'Markdown' });
+👉 Use /pay to buy more coins!`,
+      { parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '🪙 Buy Coins', callback_data: 'menu_pay' }]] }
+      });
   }
 
   try {
-    const accs   = await apiAdminAccounts();
-    const freeAccs = accs.filter(a => a.status === 'AVAILABLE');
-    if (freeAccs.length < pkg.qty) {
-      return bot.sendMessage(chatId,
-`❌ *Not enough stock!*
+    const accs = await apiAdminAccounts();
+    const free = accs.find(a => a.status === 'AVAILABLE');
+    if (!free) return bot.sendMessage(chatId, '❌ No accounts in stock right now. Try again soon.');
 
-You need *${pkg.qty}* accounts but only *${freeAccs.length}* available.
-Try a smaller package.`,
-        { parse_mode: 'Markdown' });
-    }
-
-    const selected = freeAccs.slice(0, pkg.qty);
-    const deducted = await removeCoins(userId, pkg.coins);
+    const deducted = await removeCoins(userId, price);
     if (!deducted) return bot.sendMessage(chatId, '❌ Failed to deduct coins. Try again.');
 
-    // Reserve all refs (store as JSON array in first ref's slot)
-    const refs = selected.map(a => a.ref);
     await PendingRef.findOneAndUpdate(
       { userId: String(userId) },
-      { userId: String(userId), ref: refs.join(','), qty: pkg.qty },
+      { userId: String(userId), ref: free.ref },
       { upsert: true, new: true }
     ).catch(() => {});
 
-    if (msg) log(msg, '/buyref', `pkg=${pkg.id} qty=${pkg.qty} coins=${pkg.coins}`, 'ok');
-
-    let refsText = refs.map((r, i) => (i+1) + '. `' + r + '`').join('\n');
+    log(msg, '/buyref', 'ref='+free.ref+' coins='+price, 'ok');
     bot.sendMessage(chatId,
-`╔══════════════════╗
-  ✅  *PURCHASE SUCCESS!*
-╚══════════════════╝
+`✅ *Ref Code Purchased!*
 
-${pkg.badge} *${pkg.label} Package* — ${pkg.qty} ref${pkg.qty > 1 ? 's' : ''}
+🔑 Your Ref Code:
+\`${free.ref}\`
 
-🔑 *Your Ref Code${pkg.qty > 1 ? 's' : ''}:*
-${refsText}
-
-💰 Paid: *${pkg.coins}* coins
+💰 Coins spent: *${price}*
 💳 Remaining: *${deducted.balance}* coins
 
-➡️ Use /claim to activate each account.
-_Refs are reserved for you. Coins refunded if claim fails._`,
-      { parse_mode: 'Markdown' });
+➡️ Use /claim to activate your account.
+_Ref reserved for you. Coins refunded if claim fails._`,
+      { parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[{ text: '🎮 Claim Now', callback_data: 'menu_claim' }]] }
+      });
   } catch(e) {
-    console.error('bulk coins error:', e.message);
+    console.error('/buyref error:', e.message);
     bot.sendMessage(chatId, '❌ Server error. No coins were deducted.');
   }
-}
-
-// Process a bulk purchase with Stars
-async function processBulkStars(chatId, from, pkgId) {
-  const pkg = BULK_PACKAGES.find(p => p.id === pkgId);
-  if (!pkg) return bot.sendMessage(chatId, '❌ Invalid package.');
-
-  const payload = JSON.stringify({ userId: String(from.id), pkgId, coins: pkg.coins, qty: pkg.qty });
-  try {
-    await bot.sendInvoice(
-      chatId,
-      `Kalypo Mods — ${pkg.label} Pack`,
-      `Get ${pkg.qty} ref code${pkg.qty > 1 ? 's' : ''} for ${pkg.qty} CPM2 account${pkg.qty > 1 ? 's' : ''}. Use /claim after payment.`,
-      payload,
-      '',
-      'XTR',
-      [{ label: `${pkg.qty} Ref Code${pkg.qty > 1 ? 's' : ''}`, amount: pkg.stars }]
-    );
-  } catch(e) {
-    console.error('Stars invoice error:', e.message);
-    bot.sendMessage(chatId, '❌ Could not open payment. Try coin payment instead or contact admin.');
-  }
-}
-
-bot.onText(/^\/buyref$/, async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  const cdB = checkCooldown(String(userId), 'buyref', 30);
-  if (!cdB.ok) return bot.sendMessage(chatId, '⏳ *Cooldown!* Try /buyref again in *'+cdB.remaining+'s*.', { parse_mode: 'Markdown' });
-
-  await showBulkShop(chatId, userId);
 });
 
-/* ═══════════════════════════════════
-   ADMIN COMMANDS
-═══════════════════════════════════ */
 bot.onText(/^\/approve(?: (.+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
@@ -1490,30 +1397,27 @@ bot.on('callback_query', async (query) => {
   if (data === 'menu_rank')   { fakeMsg(query, '/rank');     return; }
   if (data === 'menu_myid')   { fakeMsg(query, '/myid');     return; }
   if (data === 'menu_ref')    { fakeMsg(query, '/referral'); return; }
+  if (data.startsWith('ref_copy_')) {
+    const uid = data.replace('ref_copy_', '');
+    const uname = await getBotUsername();
+    const link  = 'https://t.me/' + uname + '?start=' + uid;
+    bot.answerCallbackQuery(query.id, { text: '🔗 Link: ' + link, show_alert: true });
+    return;
+  }
   if (data === 'menu_full')   { fakeMsg(query, '/menu');     return; }
   if (data === 'menu_send') {
     bot.sendMessage(chatId, '💸 *Send Coins*\n\nUsage: `/send @username 100`\nOr: `/send userId 100`\n\nMinimum: 10 coins · 30s cooldown between transfers', { parse_mode: 'Markdown' });
     return;
   }
-  if (data === 'pay_stars') {
-    await sendStarsInvoice(chatId, query.from);
+  // Coin package Stars payment
+  if (data.startsWith('buy_coins_')) {
+    const pkgId = data.replace('buy_coins_', '');
+    await sendCoinInvoice(chatId, query.from, pkgId);
     return;
   }
-  // Bulk coin purchase
-  if (data.startsWith('bulk_coins_')) {
-    const pkgId = data.replace('bulk_coins_', '');
-    await processBulkCoins(chatId, userId, pkgId, null);
-    return;
-  }
-  // Bulk Stars purchase
-  if (data.startsWith('bulk_stars_')) {
-    const pkgId = data.replace('bulk_stars_', '');
-    await processBulkStars(chatId, query.from, pkgId);
-    return;
-  }
-  // Open bulk shop
-  if (data === 'menu_buyref') {
-    await showBulkShop(chatId, userId);
+  // Open coin shop
+  if (data === 'menu_pay') {
+    await showCoinShop(chatId);
     return;
   }
   if (data === 'pay_manual') {
@@ -2193,19 +2097,29 @@ Try again with /claim or contact admin.`,
 /* ═══════════════════════════════════
    /referral — get personal referral link
 ═══════════════════════════════════ */
+let _botUsername = null;
+async function getBotUsername() {
+  if (!_botUsername) {
+    const info = await bot.getMe();
+    _botUsername = info.username;
+  }
+  return _botUsername;
+}
+
 bot.onText(/^\/referral$/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = String(msg.from.id);
   log(msg, '/referral', '', 'info');
 
-  const w = await getUserWallet(userId, msg.from);
-  if (!w) return bot.sendMessage(chatId, '❌ Use /start first.');
+  try {
+    const w       = await getUserWallet(userId, msg.from);
+    if (!w) return bot.sendMessage(chatId, '❌ Use /start first.');
 
-  const botInfo  = await bot.getMe();
-  const refLink  = `https://t.me/${botInfo.username}?start=${userId}`;
-  const reward   = parseInt(process.env.REFERRAL_COINS) || 100;
+    const uname   = await getBotUsername();
+    const refLink = 'https://t.me/' + uname + '?start=' + userId;
+    const reward  = parseInt(process.env.REFERRAL_COINS) || 100;
 
-  bot.sendMessage(chatId,
+    bot.sendMessage(chatId,
 `╔══════════════════════╗
   🔗  *YOUR REFERRAL LINK*
 ╚══════════════════════╝
@@ -2213,14 +2127,20 @@ bot.onText(/^\/referral$/, async (msg) => {
 Share this link with friends:
 ${refLink}
 
-💰 You earn *${reward} coins* for every person who joins!
+💰 You earn *${reward} coins* per referral!
 👥 Total referrals: *${w.referrals || 0}*
 💳 Your balance: *${w.balance}* coins
 
-_Your friend must tap the link and press Start._`,
-    { parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: [[{ text: '📤 Share Link', switch_inline_query: `Join Kalypo Mods and get bonus coins! ${refLink}` }]] }
-    });
+_Friend must tap the link and press Start._`,
+      { parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [[{ text: '📋 Copy Link', callback_data: 'ref_copy_' + userId }]]
+        }
+      });
+  } catch(e) {
+    console.error('/referral error:', e.message);
+    bot.sendMessage(chatId, '❌ Error: ' + e.message);
+  }
 });
 
 /* ═══════════════════════════════════
