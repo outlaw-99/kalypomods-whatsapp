@@ -32,6 +32,16 @@ const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || '-1003787424518';
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
+// Cache bot username to avoid repeated getMe() calls
+let _botUsername = null;
+async function getBotUsername() {
+  if (!_botUsername) {
+    const info = await bot.getMe();
+    _botUsername = info.username;
+  }
+  return _botUsername;
+}
+
 /* Global ban gate — runs before every message/command */
 bot.on('message', async (msg) => {
   if (!msg.from || msg.chat.type !== 'private') return;
@@ -74,8 +84,13 @@ const BotWalletSchema = new mongoose.Schema({
   totalEarned: { type: Number, default: 0 },  // lifetime coins received
   claims:      { type: Number, default: 0 },  // successful claims
   referredBy:  { type: String, default: '' }, // userId who referred them
-  referrals:   { type: Number, default: 0 }   // how many users they referred
-});
+  referrals:   { type: Number, default: 0 },  // how many users they referred
+  joinedAt:    { type: Date,   default: Date.now }, // when they first used the bot
+  hasPaid:     { type: Boolean, default: false }    // set true after first Stars payment
+}, { timestamps: true });
+
+const MAX_REFERRALS_PER_USER = parseInt(process.env.MAX_REFERRALS) || 20; // cap per referrer
+const MIN_ACCOUNT_AGE_DAYS   = parseInt(process.env.MIN_REF_DAYS)  || 0;  // new account filter (Telegram ID age — 0 = off)
 const BotWallet = mongoose.model('BotWallet', BotWalletSchema);
 
 const BannedSchema = new mongoose.Schema({ userId: { type: String, unique: true } });
@@ -401,8 +416,11 @@ bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
     }
     saveUser(msg.from.id);
     const newUserId = String(msg.from.id);
-    // Save name/username so leaderboard always shows real names
-    const existingWallet = await BotWallet.findOne({ userId: newUserId });
+
+    // Check if truly new BEFORE any upsert
+    const isNewUser = !(await BotWallet.findOne({ userId: newUserId }).lean().catch(() => null));
+
+    // Save name so leaderboard shows real names
     await BotWallet.findOneAndUpdate(
       { userId: newUserId },
       { $set: {
@@ -413,31 +431,61 @@ bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
       { upsert: true }
     ).catch(() => {});
 
-    // ── Referral: credit referrer if this is a new user ──────────────────
-    const REFERRAL_REWARD = parseInt(process.env.REFERRAL_COINS) || 100;
-    if (refParam && !existingWallet && refParam !== newUserId) {
-      const referrer = await BotWallet.findOne({ userId: refParam });
-      if (referrer) {
-        // Mark new user as referred
-        await BotWallet.findOneAndUpdate({ userId: newUserId }, { $set: { referredBy: refParam } }).catch(() => {});
-        // Credit referrer
-        await BotWallet.findOneAndUpdate(
-          { userId: refParam },
-          { $inc: { balance: REFERRAL_REWARD, totalEarned: REFERRAL_REWARD, referrals: 1 } }
-        ).catch(() => {});
-        log(msg, 'referral', `referrer=${refParam} reward=${REFERRAL_REWARD}`, 'ok');
-        // Notify referrer
-        const newName = msg.from.first_name || msg.from.username || 'Someone';
-        bot.sendMessage(refParam,
+    // ── Referral: anti-farm checks ───────────────────────────────────────
+    const REFERRAL_REWARD = parseInt(process.env.REFERRAL_COINS) || 5;
+    if (refParam && isNewUser && refParam !== newUserId) {
+      try {
+        const referrer = await BotWallet.findOne({ userId: String(refParam) }).lean();
+        if (referrer) {
+
+          // ANTI-FARM 1: cap total referrals per user
+          if ((referrer.referrals || 0) >= MAX_REFERRALS_PER_USER) {
+            log(msg, 'referral_blocked', 'referrer='+refParam+' reason=max_referrals', 'fail');
+            console.log('Referral blocked: '+refParam+' hit MAX_REFERRALS_PER_USER');
+            // Still register the new user, just don't reward
+          } else {
+            // ANTI-FARM 2: new user must not be a bot (from field check)
+            if (msg.from.is_bot) {
+              log(msg, 'referral_blocked', 'newUser='+newUserId+' reason=is_bot', 'fail');
+            } else {
+              // ANTI-FARM 3: referrer can't refer someone who already has a wallet
+              // (already handled by isNewUser, but double-check referredBy isn't set)
+              const newUserDoc = await BotWallet.findOne({ userId: newUserId }).lean();
+              if (!newUserDoc || !newUserDoc.referredBy) {
+                // Mark new user as referred
+                await BotWallet.findOneAndUpdate(
+                  { userId: newUserId },
+                  { $set: { referredBy: String(refParam), joinedAt: new Date() } }
+                ).catch(() => {});
+
+                // Credit referrer
+                await BotWallet.findOneAndUpdate(
+                  { userId: String(refParam) },
+                  { $inc: { balance: REFERRAL_REWARD, totalEarned: REFERRAL_REWARD, referrals: 1 } }
+                );
+
+                log(msg, 'referral', 'referrer='+refParam+' newUser='+newUserId+' reward='+REFERRAL_REWARD, 'ok');
+
+                const newName = msg.from.first_name || (msg.from.username ? '@'+msg.from.username : 'Someone');
+                bot.sendMessage(refParam,
 `╔══════════════════╗
   🎉  *REFERRAL BONUS!*
 ╚══════════════════╝
 
 👤 *${newName}* just joined using your link!
 💰 You earned *${REFERRAL_REWARD}* coins!
+👥 Total referrals: *${(referrer.referrals || 0) + 1}* / ${MAX_REFERRALS_PER_USER}
 
-Use /wallet to check your balance.`,
-          { parse_mode: 'Markdown' }).catch(() => {});
+💳 Use /wallet to check your balance.`,
+                  { parse_mode: 'Markdown' }).catch(() => {});
+              }
+            }
+          }
+        } else {
+          console.log('Referral: referrer not found for userId=' + refParam);
+        }
+      } catch(e) {
+        console.error('Referral error:', e.message);
       }
     }
   }
@@ -571,7 +619,7 @@ bot.on('message', async (msg) => {
 
     const w = await BotWallet.findOneAndUpdate(
       { userId: String(userId) },
-      { $inc: { balance: totalCoins, totalEarned: totalCoins } },
+      { $inc: { balance: totalCoins, totalEarned: totalCoins }, $set: { hasPaid: true } },
       { upsert: true, new: true }
     );
 
@@ -2097,15 +2145,6 @@ Try again with /claim or contact admin.`,
 /* ═══════════════════════════════════
    /referral — get personal referral link
 ═══════════════════════════════════ */
-let _botUsername = null;
-async function getBotUsername() {
-  if (!_botUsername) {
-    const info = await bot.getMe();
-    _botUsername = info.username;
-  }
-  return _botUsername;
-}
-
 bot.onText(/^\/referral$/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = String(msg.from.id);
@@ -2124,17 +2163,23 @@ bot.onText(/^\/referral$/, async (msg) => {
   🔗  *YOUR REFERRAL LINK*
 ╚══════════════════════╝
 
-Share this link with friends:
+Share your bot link to earn coins:
 ${refLink}
 
 💰 You earn *${reward} coins* per referral!
 👥 Total referrals: *${w.referrals || 0}*
 💳 Your balance: *${w.balance}* coins
 
-_Friend must tap the link and press Start._`,
+📢 Also invite them to our group:
+https://t.me/cpmfreeaccss
+
+_Friend must tap your link and press Start to count._`,
       { parse_mode: 'Markdown',
         reply_markup: {
-          inline_keyboard: [[{ text: '📋 Copy Link', callback_data: 'ref_copy_' + userId }]]
+          inline_keyboard: [
+            [{ text: '🤖 Share Bot Link', url: refLink }],
+            [{ text: '📢 Join Our Group',  url: 'https://t.me/cpmfreeaccss' }]
+          ]
         }
       });
   } catch(e) {
@@ -2228,6 +2273,51 @@ async function checkStockLevel() {
 
 // Check stock every 15 minutes
 setInterval(checkStockLevel, 15 * 60 * 1000);
+
+/* ═══════════════════════════════════
+   /antifarm — show suspicious referral activity
+═══════════════════════════════════ */
+bot.onText(/^\/antifarm$/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  log(msg, '/antifarm', '', 'info');
+
+  try {
+    // Find users with high referrals but no payment or claims
+    const suspicious = await BotWallet.find({
+      referrals: { $gte: 3 },
+      hasPaid:   false,
+      claims:    0
+    }).sort({ referrals: -1 }).limit(20).lean();
+
+    if (!suspicious.length) {
+      return bot.sendMessage(chatId, '✅ No suspicious referral activity detected.');
+    }
+
+    let text = `╔════════════════════╗
+  🚨  *SUSPICIOUS ACTIVITY*
+╚════════════════════╝
+
+`;
+    text += `Users with many referrals but 0 purchases/claims:
+
+`;
+
+    for (const u of suspicious) {
+      const name = u.displayName || u.username || 'Unknown';
+      text += `👤 *${name}* (\`${u.userId}\`)
+`;
+      text += `   🔗 Referrals: *${u.referrals}*  💰 Balance: *${u.balance}*  🎮 Claims: *${u.claims}*
+
+`;
+    }
+
+    text += `_Use /ban <userId> to ban suspicious users._`;
+    bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Error: ' + e.message);
+  }
+});
 
 /* ═══════════════════════════════════
    /stats — admin dashboard
