@@ -978,7 +978,7 @@ async function resolveTarget(msg, userArg) {
   if (userArg) {
     if (userArg.startsWith('@')) {
       const uname = userArg.replace(/^@/, '');
-      const w = await BotWallet.findOne({ username: { $regex: '^@?' + uname + '$', $options: 'i' } });
+      const w = await BotWallet.findOne({ username: { $regex: '^@?' + uname + '$', $options: 'i' } }).catch(() => null);
       if (!w) return { err: `No user found with username @${uname}. They must have used the bot first.` };
       return { userId: w.userId, targetName: '@' + uname };
     }
@@ -998,64 +998,74 @@ function adminCoinMsg(action, targetName, userId, delta, newBal) {
 bot.onText(/^\/gc (\d+)$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const inGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
-  if (!ADMIN_IDS.includes(String(msg.from.id))) { if (!inGroup) bot.sendMessage(chatId, '🚫 Admin only.'); return; }
-  if (!msg.reply_to_message) return bot.sendMessage(chatId, '❌ Reply to someone, or use: /gc <userId|@username> <amount>');
+  try {
+    if (!ADMIN_IDS.includes(String(msg.from.id))) { if (!inGroup) bot.sendMessage(chatId, '🚫 Admin only.'); return; }
+    if (!msg.reply_to_message) return bot.sendMessage(chatId, '❌ Reply to someone, or use: /gc <userId|@username> <amount>');
 
-  const { userId, targetName, err } = await resolveTarget(msg, null);
-  if (err) return bot.sendMessage(chatId, '❌ ' + err);
-  const amount = parseInt(match[1]);
-  if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
+    const { userId, targetName, err } = await resolveTarget(msg, null);
+    if (err) return bot.sendMessage(chatId, '❌ ' + err);
+    const amount = parseInt(match[1]);
+    if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
 
-  const w = await addCoins(userId, amount);
-  if (!w) return bot.sendMessage(chatId, '❌ Error updating balance.');
-  log(msg, '/gc', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
+    const w = await addCoins(userId, amount);
+    if (!w) return bot.sendMessage(chatId, '❌ Error updating balance.');
+    log(msg, '/gc', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
 
-  const txt = adminCoinMsg('Added', targetName, userId, amount, w.balance);
-  bot.sendMessage(userId,
+    const txt = adminCoinMsg('Added', targetName, userId, amount, w.balance);
+    bot.sendMessage(userId,
 `╔══════════════════╗\n  🎁  *COINS RECEIVED!*\n╚══════════════════╝\n\n💰 You received *${amount}* coins from admin!\n💳 New Balance: *${w.balance}* coins\n\nUse /wallet to check your balance.`,
-    { parse_mode: 'Markdown' }).catch(() => {});
+      { parse_mode: 'Markdown' }).catch(() => {});
 
-  if (inGroup) {
-    bot.deleteMessage(chatId, msg.message_id).catch(() => {});
-    const sent = await bot.sendMessage(msg.from.id, txt, { parse_mode: 'Markdown' }).then(() => true).catch(() => false);
-    if (!sent) {
-      const tmp = await bot.sendMessage(chatId, txt, { parse_mode: 'Markdown', disable_notification: true }).catch(() => null);
-      if (tmp) setTimeout(() => bot.deleteMessage(chatId, tmp.message_id).catch(() => {}), 6000);
+    if (inGroup) {
+      bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+      const sent = await bot.sendMessage(msg.from.id, txt, { parse_mode: 'Markdown' }).then(() => true).catch(() => false);
+      if (!sent) {
+        const tmp = await bot.sendMessage(chatId, txt, { parse_mode: 'Markdown', disable_notification: true }).catch(() => null);
+        if (tmp) setTimeout(() => bot.deleteMessage(chatId, tmp.message_id).catch(() => {}), 6000);
+      }
+    } else {
+      bot.sendMessage(chatId, txt, { parse_mode: 'Markdown' });
     }
-  } else {
-    bot.sendMessage(chatId, txt, { parse_mode: 'Markdown' });
+  } catch(e) {
+    console.error('/gc error:', e.message);
+    bot.sendMessage(chatId, '❌ Error: ' + e.message).catch(() => {});
   }
 });
 
 bot.onText(/^\/gc (@\S+|[^\d]\S*) (\d+)$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const inGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
-  if (!ADMIN_IDS.includes(String(msg.from.id))) { if (!inGroup) bot.sendMessage(chatId, '🚫 Admin only.'); return; }
+  try {
+    if (!ADMIN_IDS.includes(String(msg.from.id))) { if (!inGroup) bot.sendMessage(chatId, '🚫 Admin only.'); return; }
 
-  const { userId, targetName, err } = await resolveTarget(msg, match[1]);
-  if (err) return bot.sendMessage(chatId, '❌ ' + err);
-  const amount = parseInt(match[2]);
-  if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
+    const { userId, targetName, err } = await resolveTarget(msg, match[1]);
+    if (err) return bot.sendMessage(chatId, '❌ ' + err);
+    const amount = parseInt(match[2]);
+    if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
 
-  await CommandLog.create({ userId: String(msg.from.id), username: msg.from.username || msg.from.first_name || 'Unknown', command: 'gc', params: { targetUserId: userId, amount } }).catch(() => {});
-  const w = await addCoins(userId, amount);
-  if (!w) return bot.sendMessage(chatId, '❌ Error updating balance.');
-  log(msg, '/gc', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
+    await CommandLog.create({ userId: String(msg.from.id), username: msg.from.username || msg.from.first_name || 'Unknown', command: 'gc', params: { targetUserId: userId, amount } }).catch(() => {});
+    const w = await addCoins(userId, amount);
+    if (!w) return bot.sendMessage(chatId, '❌ Error updating balance.');
+    log(msg, '/gc', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
 
-  const txt = adminCoinMsg('Added', targetName, userId, amount, w.balance);
-  bot.sendMessage(userId,
+    const txt = adminCoinMsg('Added', targetName, userId, amount, w.balance);
+    bot.sendMessage(userId,
 `╔══════════════════╗\n  🎁  *COINS RECEIVED!*\n╚══════════════════╝\n\n💰 You received *${amount}* coins from admin!\n💳 New Balance: *${w.balance}* coins\n\nUse /wallet to check your balance.`,
-    { parse_mode: 'Markdown' }).catch(() => {});
+      { parse_mode: 'Markdown' }).catch(() => {});
 
-  if (inGroup) {
-    bot.deleteMessage(chatId, msg.message_id).catch(() => {});
-    const sent = await bot.sendMessage(msg.from.id, txt, { parse_mode: 'Markdown' }).then(() => true).catch(() => false);
-    if (!sent) {
-      const tmp = await bot.sendMessage(chatId, txt, { parse_mode: 'Markdown', disable_notification: true }).catch(() => null);
-      if (tmp) setTimeout(() => bot.deleteMessage(chatId, tmp.message_id).catch(() => {}), 6000);
+    if (inGroup) {
+      bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+      const sent = await bot.sendMessage(msg.from.id, txt, { parse_mode: 'Markdown' }).then(() => true).catch(() => false);
+      if (!sent) {
+        const tmp = await bot.sendMessage(chatId, txt, { parse_mode: 'Markdown', disable_notification: true }).catch(() => null);
+        if (tmp) setTimeout(() => bot.deleteMessage(chatId, tmp.message_id).catch(() => {}), 6000);
+      }
+    } else {
+      bot.sendMessage(chatId, txt, { parse_mode: 'Markdown' });
     }
-  } else {
-    bot.sendMessage(chatId, txt, { parse_mode: 'Markdown' });
+  } catch(e) {
+    console.error('/gc error:', e.message);
+    bot.sendMessage(chatId, '❌ Error: ' + e.message).catch(() => {});
   }
 });
 
@@ -1063,29 +1073,39 @@ bot.onText(/^\/gc (@\S+|[^\d]\S*) (\d+)$/, async (msg, match) => {
 // /rc <userId|@u> <amount>
 bot.onText(/^\/rc (\d+)$/, async (msg, match) => {
   const chatId = msg.chat.id;
-  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
-  if (!msg.reply_to_message) return bot.sendMessage(chatId, '❌ Reply to someone, or use: /rc <userId|@username> <amount>');
-  const { userId, targetName, err } = await resolveTarget(msg, null);
-  if (err) return bot.sendMessage(chatId, '❌ ' + err);
-  const amount = parseInt(match[1]);
-  if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
-  const w = await removeCoins(userId, amount);
-  if (!w) return bot.sendMessage(chatId, "❌ User doesn't have enough coins or doesn't exist.");
-  log(msg, '/rc', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
-  bot.sendMessage(chatId, adminCoinMsg('Removed', targetName, userId, -amount, w.balance), { parse_mode: 'Markdown' });
+  try {
+    if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+    if (!msg.reply_to_message) return bot.sendMessage(chatId, '❌ Reply to someone, or use: /rc <userId|@username> <amount>');
+    const { userId, targetName, err } = await resolveTarget(msg, null);
+    if (err) return bot.sendMessage(chatId, '❌ ' + err);
+    const amount = parseInt(match[1]);
+    if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
+    const w = await removeCoins(userId, amount);
+    if (!w) return bot.sendMessage(chatId, "❌ User doesn't have enough coins or doesn't exist.");
+    log(msg, '/rc', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
+    bot.sendMessage(chatId, adminCoinMsg('Removed', targetName, userId, -amount, w.balance), { parse_mode: 'Markdown' });
+  } catch(e) {
+    console.error('/rc error:', e.message);
+    bot.sendMessage(chatId, '❌ Error: ' + e.message).catch(() => {});
+  }
 });
 
 bot.onText(/^\/rc (@\S+|[^\d]\S*) (\d+)$/, async (msg, match) => {
   const chatId = msg.chat.id;
-  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
-  const { userId, targetName, err } = await resolveTarget(msg, match[1]);
-  if (err) return bot.sendMessage(chatId, '❌ ' + err);
-  const amount = parseInt(match[2]);
-  if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
-  const w = await removeCoins(userId, amount);
-  if (!w) return bot.sendMessage(chatId, "❌ User doesn't have enough coins or doesn't exist.");
-  log(msg, '/rc', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
-  bot.sendMessage(chatId, adminCoinMsg('Removed', targetName, userId, -amount, w.balance), { parse_mode: 'Markdown' });
+  try {
+    if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+    const { userId, targetName, err } = await resolveTarget(msg, match[1]);
+    if (err) return bot.sendMessage(chatId, '❌ ' + err);
+    const amount = parseInt(match[2]);
+    if (amount <= 0) return bot.sendMessage(chatId, '❌ Amount must be positive.');
+    const w = await removeCoins(userId, amount);
+    if (!w) return bot.sendMessage(chatId, "❌ User doesn't have enough coins or doesn't exist.");
+    log(msg, '/rc', `target=${userId} amount=${amount} newbal=${w.balance}`, 'ok');
+    bot.sendMessage(chatId, adminCoinMsg('Removed', targetName, userId, -amount, w.balance), { parse_mode: 'Markdown' });
+  } catch(e) {
+    console.error('/rc error:', e.message);
+    bot.sendMessage(chatId, '❌ Error: ' + e.message).catch(() => {});
+  }
 });
 
 // /setbal <userId|@u> <amount> — set exact balance
@@ -1200,12 +1220,13 @@ bot.onText(/^\/approve(?: (.+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
 
-  // Support: /approve (reply), /approve userId, /approve @username
-  const { userId: targetUserId, targetName, err } = await resolveTarget(msg, match[1] ? match[1].trim() : null);
-  if (err) return bot.sendMessage(chatId, '❌ ' + err + '\nUsage: reply to someone or use /approve <userId|@username>');
-  log(msg, '/approve', `target=${targetUserId}`, 'info');
-  bot.sendMessage(chatId, '🔄 Finding a free account...');
   try {
+    // Support: /approve (reply), /approve userId, /approve @username
+    var { userId: targetUserId, targetName, err } = await resolveTarget(msg, match[1] ? match[1].trim() : null);
+    if (err) return bot.sendMessage(chatId, '❌ ' + err + '\nUsage: reply to someone or use /approve <userId|@username>');
+    log(msg, '/approve', `target=${targetUserId}`, 'info');
+    bot.sendMessage(chatId, '🔄 Finding a free account...');
+
     const accs = await apiAdminAccounts();
     if (accs.error) return bot.sendMessage(chatId, '❌ ' + accs.error);
     const free = accs.find(a => a.status === 'AVAILABLE');
@@ -2412,11 +2433,11 @@ bot.onText(/^\/dm (@?\S+) (.+)$/s, async (msg, match) => {
   const chatId = msg.chat.id;
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
 
-  const { userId, targetName, err } = await resolveTarget(msg, match[1]);
-  if (err) return bot.sendMessage(chatId, '❌ ' + err);
-  const message = match[2].trim();
-
   try {
+    var { userId, targetName, err } = await resolveTarget(msg, match[1]);
+    if (err) return bot.sendMessage(chatId, '❌ ' + err);
+    const message = match[2].trim();
+
     await bot.sendMessage(userId,
 `📩 *Message from Admin*\n\n${message}`,
       { parse_mode: 'Markdown' });
