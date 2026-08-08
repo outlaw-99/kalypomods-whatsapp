@@ -366,6 +366,95 @@ async function apiAdminReset(ref) {
 }
 
 /* ═══════════════════════════════════
+   ACCOUNT VALIDATOR
+   Checks every account in the shop by actually logging in
+   with cpm2Login(), so "AVAILABLE" only means "confirmed working".
+
+   NOTE: apiAdminAccounts() currently only exposes { ref, status, claimedEmail }
+   in this codebase. To really validate we need the account's real login
+   email/password. This tries a handful of common field names in case the
+   server already returns them — if your /api/admin/accounts response uses
+   different field names, just add them to CRED_FIELD_PAIRS below.
+═══════════════════════════════════ */
+const CRED_FIELD_PAIRS = [
+  ['email', 'password'],
+  ['originalEmail', 'originalPassword'],
+  ['login', 'pass'],
+  ['username', 'password'],
+  ['claimedEmail', 'claimedPassword'], // fallback: post-claim creds, if that's all that's stored
+];
+
+function extractCreds(acc) {
+  for (const [eKey, pKey] of CRED_FIELD_PAIRS) {
+    if (acc[eKey] && acc[pKey]) return { email: acc[eKey], password: acc[pKey] };
+  }
+  return null;
+}
+
+async function validateAccount(acc) {
+  const creds = extractCreds(acc);
+  if (!creds) return { ref: acc.ref, ok: null, reason: 'No credentials found on this record' };
+  try {
+    const result = await cpm2Login(creds.email, creds.password);
+    return result.ok
+      ? { ref: acc.ref, ok: true }
+      : { ref: acc.ref, ok: false, reason: result.msg || 'Login rejected' };
+  } catch (e) {
+    return { ref: acc.ref, ok: false, reason: 'Error: ' + e.message };
+  }
+}
+
+let validateLock = false;
+
+/* Runs the full validation pass, sending progress + a final summary to chatId. */
+async function runValidation(chatId, accounts) {
+  const total = accounts.length;
+  let working = 0, broken = 0, skipped = 0;
+  const brokenList = [];
+  const skippedList = [];
+
+  const progressMsg = await bot.sendMessage(chatId, `🔄 Validating *0/${total}* accounts...`, { parse_mode: 'Markdown' }).catch(() => null);
+
+  for (let i = 0; i < accounts.length; i++) {
+    const acc = accounts[i];
+    const r = await validateAccount(acc);
+
+    if (r.ok === true) working++;
+    else if (r.ok === false) { broken++; brokenList.push(r); }
+    else { skipped++; skippedList.push(r); }
+
+    // Update progress every 10 accounts (avoid Telegram edit-rate limits)
+    if (progressMsg && (i % 10 === 0 || i === accounts.length - 1)) {
+      bot.editMessageText(`🔄 Validating *${i + 1}/${total}* accounts... (✅ ${working}  ❌ ${broken}  ⚪ ${skipped})`, {
+        chat_id: chatId, message_id: progressMsg.message_id, parse_mode: 'Markdown'
+      }).catch(() => {});
+    }
+
+    // Small delay so we don't hammer the CPM2 login endpoint
+    await new Promise(res => setTimeout(res, 400));
+  }
+
+  let text = `╔══════════════════╗\n  ✅  *VALIDATION COMPLETE*\n╚══════════════════╝\n\n`;
+  text += `📦 Total checked: *${total}*\n`;
+  text += `🟢 Working: *${working}*\n`;
+  text += `🔴 Broken: *${broken}*\n`;
+  text += `⚪ Skipped (no credentials): *${skipped}*\n\n`;
+
+  if (brokenList.length) {
+    text += `*🔴 Broken accounts:*\n`;
+    brokenList.slice(0, 25).forEach(b => { text += `• \`${b.ref}\` — ${b.reason}\n`; });
+    if (brokenList.length > 25) text += `_...and ${brokenList.length - 25} more (see /logs for full run)_\n`;
+    text += `\nUse /reset <ref> to reset a broken account, or pull it from stock.\n`;
+  }
+  if (skippedList.length && skippedList.length === total) {
+    text += `\n⚠️ *No accounts had usable credentials.* Your /api/admin/accounts endpoint needs to return the original email/password for each account for this to work — check CRED_FIELD_PAIRS in bot.js against your server's actual field names.`;
+  }
+
+  await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' }).catch(() => {});
+  return { total, working, broken, skipped, brokenList };
+}
+
+/* ═══════════════════════════════════
    SCHEDULER
 ═══════════════════════════════════ */
 function msUntilNext(hour, minute) {
@@ -1291,6 +1380,37 @@ bot.onText(/^\/stock$/, async (msg) => {
   }
 });
 
+/* ═══════════════════════════════════
+   /validate — check every account actually still logs in
+   /validate available — only check AVAILABLE accounts (faster, most useful)
+═══════════════════════════════════ */
+bot.onText(/^\/validate(?: (all|available))?$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  if (validateLock) return bot.sendMessage(chatId, '⏳ A validation run is already in progress. Wait for it to finish.');
+
+  const scope = (match[1] || 'available').toLowerCase();
+  log(msg, '/validate', 'scope=' + scope, 'info');
+
+  try {
+    const accs = await apiAdminAccounts();
+    if (accs.error) return bot.sendMessage(chatId, '❌ ' + accs.error);
+
+    const targets = scope === 'all' ? accs : accs.filter(a => a.status === 'AVAILABLE');
+    if (!targets.length) return bot.sendMessage(chatId, `📭 No ${scope === 'all' ? '' : 'available '}accounts to validate.`);
+
+    validateLock = true;
+    bot.sendMessage(chatId, `🔍 Starting validation of *${targets.length}* account${targets.length === 1 ? '' : 's'} (scope: ${scope})...`, { parse_mode: 'Markdown' });
+
+    const result = await runValidation(chatId, targets);
+    log(msg, '/validate', `scope=${scope} total=${result.total} working=${result.working} broken=${result.broken} skipped=${result.skipped}`, 'ok');
+  } catch (e) {
+    bot.sendMessage(chatId, '❌ Validation error: ' + e.message);
+  } finally {
+    validateLock = false;
+  }
+});
+
 bot.onText(/^\/reset (.+)$/, async (msg, match) => {
   const chatId = msg.chat.id;
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
@@ -1332,6 +1452,7 @@ bot.onText(/^\/menu$/, (msg) => {
     [{ text: '📊 Stats',           callback_data: 'adm_stats'    }, { text: '💳 All Wallets',  callback_data: 'adm_wallets' }],
     [{ text: '📋 List Accounts',   callback_data: 'adm_list'     }, { text: '🟡 Pending',      callback_data: 'adm_pending' }],
     [{ text: '📦 Stock',           callback_data: 'adm_stock'    }, { text: '📈 Log Stats',    callback_data: 'adm_logstats'}],
+    [{ text: '🔍 Validate Accounts', callback_data: 'adm_validate' }],
   ] : [];
 
   bot.sendMessage(chatId,
@@ -1456,6 +1577,12 @@ bot.on('callback_query', async (query) => {
   const userId = String(query.from.id);
   const data   = query.data;
   bot.answerCallbackQuery(query.id).catch(() => {});
+  // NOTE: a callback query can only be answered ONCE, and we already answered it
+  // (blank) above. That means the old `answerCallbackQuery(query.id, {show_alert...})`
+  // calls below for admin-only buttons were silently failing — non-admins tapping
+  // an admin button got no feedback at all. Use rejectAdminOnly() instead, which
+  // sends a normal chat message so it always shows up.
+  const rejectAdminOnly = () => bot.sendMessage(chatId, '🚫 Admin only.').catch(() => {});
 
   // ── MENU buttons ──────────────────────────────────────────────────────────
   if (data === 'menu_pay')    { fakeMsg(query, '/pay');      return; }
@@ -1504,28 +1631,32 @@ Then use /buyref → /claim to get your account.`,
 
   // ── ADMIN panel buttons ───────────────────────────────────────────────────
   if (data === 'adm_stats') {
-    if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
+    if (!isAdmin(query)) return rejectAdminOnly();
     fakeMsg(query, '/stats');    return;
   }
   if (data === 'adm_wallets') {
-    if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
+    if (!isAdmin(query)) return rejectAdminOnly();
     fakeMsg(query, '/wallets');  return;
   }
   if (data === 'adm_list') {
-    if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
+    if (!isAdmin(query)) return rejectAdminOnly();
     fakeMsg(query, '/list');     return;
   }
   if (data === 'adm_pending') {
-    if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
+    if (!isAdmin(query)) return rejectAdminOnly();
     fakeMsg(query, '/pending');  return;
   }
   if (data === 'adm_stock') {
-    if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
+    if (!isAdmin(query)) return rejectAdminOnly();
     fakeMsg(query, '/stock');    return;
   }
   if (data === 'adm_logstats') {
-    if (!isAdmin(query)) return bot.answerCallbackQuery(query.id, { text: '🚫 Admin only', show_alert: true });
+    if (!isAdmin(query)) return rejectAdminOnly();
     fakeMsg(query, '/logstats'); return;
+  }
+  if (data === 'adm_validate') {
+    if (!isAdmin(query)) return rejectAdminOnly();
+    fakeMsg(query, '/validate'); return;
   }
 
   // ── LEADERBOARD pagination ────────────────────────────────────────────────
