@@ -344,6 +344,97 @@ async function apiAdminAccounts() {
     throw new Error('🔌 Server offline: ' + e.message);
   }
 }
+
+/* Updates a single account's stored credentials.
+   REQUIRES a matching endpoint on your server — if you don't have one yet, add:
+     PATCH /api/admin/accounts/:ref   (header: x-admin-key)
+     body: { "claimedEmail": "..." }  OR  { "claimedPassword": "..." }
+   Have it find the account by ref, set whichever field was sent, save, and
+   respond with { ok: true }. */
+async function apiAdminUpdateAccount(ref, updates) {
+  try {
+    const r = await fetch(`${SERVER_URL}/api/admin/accounts/${encodeURIComponent(ref)}`, {
+      method: 'PATCH',
+      headers: { 'x-admin-key': ADMIN_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates)
+    });
+    if (!r.ok) return { ok: false, msg: `Server returned ${r.status} — you likely need to add this endpoint, see the comment above apiAdminUpdateAccount() in bot.js` };
+    return r.json();
+  } catch (e) {
+    return { ok: false, msg: '🔌 Server offline: ' + e.message };
+  }
+}
+
+/* Any of these field names found on an account record will be shown on the /acc detail card. */
+const CREDENTIAL_DISPLAY_KEYS = ['claimedEmail', 'claimedPassword', 'email', 'password', 'originalEmail', 'originalPassword'];
+
+function buildAccountDetailCard(acc) {
+  let text = `╔══════════════════╗\n  📄 *ACCOUNT DETAILS*\n╚══════════════════╝\n\n`;
+  text += `🔖 Ref: \`${acc.ref}\`\n`;
+  text += `${statusEmoji(acc.status)} Status: *${acc.status}*\n\n`;
+
+  let foundAny = false;
+  const seen = new Set();
+  for (const key of CREDENTIAL_DISPLAY_KEYS) {
+    const lower = key.toLowerCase();
+    const bucket = lower.includes('pass') ? 'pass' : 'mail';
+    if (acc[key] && !seen.has(bucket)) {
+      foundAny = true;
+      seen.add(bucket);
+      const label = bucket === 'pass' ? '🔑 Password' : '📧 Email';
+      text += `${label}: \`${acc[key]}\`\n`;
+    }
+  }
+  if (!foundAny) {
+    text += `⚠️ No email/password on this record.\nEither it's unclaimed, or your /api/admin/accounts endpoint doesn't return credential fields yet — check what field names your server actually uses and add them to CREDENTIAL_DISPLAY_KEYS near the top of this block in bot.js.\n`;
+  }
+
+  const buttons = [
+    [{ text: '✏️ Edit Email', callback_data: `acc_edit_email:${acc.ref}` }, { text: '✏️ Edit Password', callback_data: `acc_edit_pass:${acc.ref}` }],
+  ];
+  return { text, buttons };
+}
+
+const adminEditSessions = {}; // chatId -> { ref, field }
+
+bot.onText(/^\/acc (\S+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  const ref = match[1];
+  try {
+    const accs = await apiAdminAccounts();
+    const found = Array.isArray(accs) ? accs.find(a => a.ref === ref) : null;
+    if (!found) return bot.sendMessage(chatId, `❌ No account found with ref \`${ref}\`.`, { parse_mode: 'Markdown' });
+    const { text, buttons } = buildAccountDetailCard(found);
+    bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
+  } catch (e) {
+    bot.sendMessage(chatId, '❌ ' + e.message);
+  }
+});
+
+/* Catches the admin's reply after they tap Edit Email / Edit Password on an /acc card. */
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+  const editSession = adminEditSessions[chatId];
+  if (!editSession || !msg.text) return;
+  if (!isAdmin(msg)) return; // shouldn't happen, session is only ever set for admins
+
+  if (msg.text === '/cancel') {
+    delete adminEditSessions[chatId];
+    return bot.sendMessage(chatId, '❌ Edit cancelled.');
+  }
+
+  const newValue = msg.text.trim();
+  const serverField = editSession.field === 'email' ? 'claimedEmail' : 'claimedPassword';
+  const result = await apiAdminUpdateAccount(editSession.ref, { [serverField]: newValue });
+  delete adminEditSessions[chatId];
+
+  if (result.ok === false) {
+    return bot.sendMessage(chatId, `❌ Update failed: ${result.msg}`);
+  }
+  log(msg, 'acc:edit', `ref=${editSession.ref} field=${editSession.field}`, 'ok');
+  bot.sendMessage(chatId, `✅ Updated ${editSession.field} for \`${editSession.ref}\`.`, { parse_mode: 'Markdown' });
+});
 async function apiAdminStats() {
   try {
     const r = await fetch(`${SERVER_URL}/api/admin/stats`, { headers: { 'x-admin-key': ADMIN_KEY } });
@@ -1411,6 +1502,69 @@ bot.onText(/^\/validate(?: (all|available))?$/, async (msg, match) => {
   }
 });
 
+let bulkEditLock = false;
+const pendingBulkEdits = {}; // chatId -> { start, end, password, ts }
+
+async function runBulkEditRefs(chatId, start, end, password) {
+  const total = end - start + 1;
+  let ok = 0, fail = 0;
+  const failList = [];
+
+  const progressMsg = await bot.sendMessage(chatId, `🔄 Updating *0/${total}* accounts...`, { parse_mode: 'Markdown' }).catch(() => null);
+
+  for (let i = start; i <= end; i++) {
+    const ref = String(i);
+    const result = await apiAdminUpdateAccount(ref, { claimedPassword: password });
+    if (result.ok === false) { fail++; failList.push({ ref, reason: result.msg || 'failed' }); }
+    else ok++;
+
+    const done = i - start + 1;
+    if (progressMsg && (done % 25 === 0 || done === total)) {
+      bot.editMessageText(`🔄 Updating *${done}/${total}* accounts... (✅ ${ok}  ❌ ${fail})`, {
+        chat_id: chatId, message_id: progressMsg.message_id, parse_mode: 'Markdown'
+      }).catch(() => {});
+    }
+    await new Promise(res => setTimeout(res, 200));
+  }
+
+  let text = `╔══════════════════╗\n  ✅  *BULK EDIT COMPLETE*\n╚══════════════════╝\n\n`;
+  text += `📦 Range: ref \`${start}\` to \`${end}\` (${total} total)\n`;
+  text += `🟢 Updated: *${ok}*\n`;
+  text += `🔴 Failed: *${fail}*\n\n`;
+  if (failList.length) {
+    text += `*🔴 Failed refs:*\n`;
+    failList.slice(0, 25).forEach(f => { text += `• \`${f.ref}\` — ${f.reason}\n`; });
+    if (failList.length > 25) text += `_...and ${failList.length - 25} more_\n`;
+  }
+  await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' }).catch(() => {});
+}
+
+bot.onText(/^\/editref (\d+):(\d+) (.+)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
+  if (bulkEditLock) return bot.sendMessage(chatId, '⏳ A bulk edit is already in progress. Wait for it to finish.');
+
+  let start = parseInt(match[1]), end = parseInt(match[2]);
+  const password = match[3].trim();
+  if (start > end) [start, end] = [end, start];
+  const total = end - start + 1;
+
+  if (total > 2000) {
+    return bot.sendMessage(chatId, `⚠️ That's ${total} accounts — capped at 2000 per run for safety. Split it into smaller batches.`);
+  }
+
+  pendingBulkEdits[chatId] = { start, end, password, ts: Date.now() };
+  const preview = password.length <= 4 ? password : password.slice(0, 2) + '•'.repeat(password.length - 2);
+  bot.sendMessage(chatId,
+    `⚠️ *Confirm bulk edit*\n\nSet password to \`${preview}\` for refs \`${start}\`–\`${end}\` (*${total} accounts*)?\n\nThis overwrites the existing password on every one of them.`,
+    { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[
+      { text: '✅ Confirm', callback_data: 'bulkedit_confirm' },
+      { text: '❌ Cancel', callback_data: 'bulkedit_cancel' }
+    ]] } }
+  );
+  log(msg, '/editref', `range=${start}:${end} count=${total}`, 'info');
+});
+
 bot.onText(/^\/reset (.+)$/, async (msg, match) => {
   const chatId = msg.chat.id;
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
@@ -1657,6 +1811,37 @@ Then use /buyref → /claim to get your account.`,
   if (data === 'adm_validate') {
     if (!isAdmin(query)) return rejectAdminOnly();
     fakeMsg(query, '/validate'); return;
+  }
+  if (data.startsWith('acc_edit_email:') || data.startsWith('acc_edit_pass:')) {
+    if (!isAdmin(query)) return rejectAdminOnly();
+    const sepIdx = data.indexOf(':');
+    const prefix = data.slice(0, sepIdx);
+    const ref = data.slice(sepIdx + 1);
+    const field = prefix === 'acc_edit_email' ? 'email' : 'password';
+    adminEditSessions[chatId] = { ref, field };
+    bot.sendMessage(chatId, `✏️ Send the new ${field} for \`${ref}\` (or /cancel):`, { parse_mode: 'Markdown' });
+    return;
+  }
+  if (data === 'bulkedit_confirm' || data === 'bulkedit_cancel') {
+    if (!isAdmin(query)) return rejectAdminOnly();
+    const pending = pendingBulkEdits[chatId];
+    delete pendingBulkEdits[chatId];
+    if (!pending) return bot.sendMessage(chatId, '⚠️ That confirmation expired. Run /editref again.');
+    if (data === 'bulkedit_cancel') return bot.sendMessage(chatId, '❌ Bulk edit cancelled.');
+    if (Date.now() - pending.ts > 5 * 60 * 1000) return bot.sendMessage(chatId, '⚠️ That confirmation expired (5 min). Run /editref again.');
+    if (bulkEditLock) return bot.sendMessage(chatId, '⏳ A bulk edit is already in progress.');
+
+    bulkEditLock = true;
+    bot.sendMessage(chatId, `▶️ Starting bulk edit for refs ${pending.start}–${pending.end}...`);
+    try {
+      await runBulkEditRefs(chatId, pending.start, pending.end, pending.password);
+      log({ from: query.from, chat: { id: chatId } }, 'editref:done', `range=${pending.start}:${pending.end}`, 'ok');
+    } catch (e) {
+      bot.sendMessage(chatId, '❌ Bulk edit error: ' + e.message);
+    } finally {
+      bulkEditLock = false;
+    }
+    return;
   }
 
   // ── LEADERBOARD pagination ────────────────────────────────────────────────
