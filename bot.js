@@ -233,10 +233,27 @@ async function cpm1Load(token, uid) {
 }
 
 async function cpm1Save(token, uid, rec, orig) {
-  const payload = await cpm1BuildPayload(rec, uid, orig);
+  // Always send ALL fields (like Axel bot) - pass null orig
+  const payload = await cpm1BuildPayload(rec, uid, null);
   const r = await cpm1Post(CPM1_SAVE, { data:{ data:payload, deviceId:uid.slice(0,8) } }, token);
-  const v = r?.result ?? r?.ok ?? r?.success;
-  return v === 1 || v === true || v === '1';
+  console.log('[CPM1 Save] response:', JSON.stringify(r));
+  if (!r) return false;
+  // Accept any truthy result
+  const v = r?.result ?? r?.ok ?? r?.success ?? r?.data;
+  return !!v || v === 0 ? Number(v) !== 0 : false;
+}
+
+// Load fresh data then apply changes and save
+async function cpm1ModifyAndSave(token, uid, changes) {
+  const fresh = await cpm1Load(token, uid);
+  if (!fresh) return false;
+  const updated = { ...fresh, ...changes };
+  const payload = await cpm1BuildPayload(updated, uid, null);
+  const r = await cpm1Post(CPM1_SAVE, { data:{ data:payload, deviceId:uid.slice(0,8) } }, token);
+  console.log('[CPM1 ModifySave] response:', JSON.stringify(r));
+  if (!r) return false;
+  const v = r?.result ?? r?.ok ?? r?.success ?? r?.data;
+  return v === 1 || v === true || v === '1' || v === 'ok';
 }
 
 async function cpm1SetRank(token) {
@@ -246,23 +263,21 @@ async function cpm1SetRank(token) {
 }
 
 async function cpm1SetFloats(token, uid, rec, idxVals) {
-  const updated = JSON.parse(JSON.stringify(rec));
-  const fl = [...(updated.floats || [])];
+  const fresh = await cpm1Load(token, uid) || rec;
+  const fl = [...(fresh.floats || [])];
   const maxIdx = Math.max(...idxVals.map(([i]) => i));
   while (fl.length <= maxIdx) fl.push(0);
   for (const [idx, val] of idxVals) fl[idx] = val;
-  updated.floats = fl;
-  return cpm1Save(token, uid, updated, rec);
+  return cpm1ModifyAndSave(token, uid, { floats: fl });
 }
 
 async function cpm1SetIntegers(token, uid, rec, idxVals) {
-  const updated = JSON.parse(JSON.stringify(rec));
-  const it = [...(updated.integers || [])];
+  const fresh = await cpm1Load(token, uid) || rec;
+  const it = [...(fresh.integers || [])];
   const maxIdx = Math.max(...idxVals.map(([i]) => i));
   while (it.length <= maxIdx) it.push(0);
   for (const [idx, val] of idxVals) it[idx] = val;
-  updated.integers = it;
-  return cpm1Save(token, uid, updated, rec);
+  return cpm1ModifyAndSave(token, uid, { integers: it });
 }
 
 async function cpm1UnlockW16(token, uid, rec)       { return cpm1SetFloats(token, uid, rec, [[32, 1]]); }
@@ -275,48 +290,45 @@ async function cpm1SetLoses(token, uid, rec, n)     { return cpm1SetFloats(token
 async function cpm1UnlockHouses(token, uid, rec)    { return cpm1SetIntegers(token, uid, rec, [[8,1],[110,1],[111,1],[112,1]]); }
 
 async function cpm1SetName(token, uid, rec, name) {
-  return cpm1Save(token, uid, { ...rec, Name: name }, rec);
+  return cpm1ModifyAndSave(token, uid, { Name: name });
 }
 async function cpm1SetPlayerID(token, uid, rec, pid) {
-  return cpm1Save(token, uid, { ...rec, localID: pid.toUpperCase() }, rec);
+  return cpm1ModifyAndSave(token, uid, { localID: pid.toUpperCase() });
 }
 
 async function cpm1UnlockAnimations(token, uid, rec) {
-  const updated = JSON.parse(JSON.stringify(rec));
-  const existing = new Set(updated.animations || []);
+  const fresh = await cpm1Load(token, uid) || rec;
+  const existing = new Set(fresh.animations || []);
   for (let i = 0; i < 301; i++) existing.add(i);
-  updated.animations = [...existing];
-  return cpm1Save(token, uid, updated, rec);
+  return cpm1ModifyAndSave(token, uid, { animations: [...existing] });
 }
 
 async function cpm1UnlockWheels(token, uid, rec) {
-  const updated = JSON.parse(JSON.stringify(rec));
-  const existing = new Set(updated.wheels || []);
-  for (let i = 73; i < 221; i++) existing.add(i);
-  updated.wheels = [...existing];
-  const it = [...(updated.integers || [])];
+  const fresh = await cpm1Load(token, uid) || rec;
+  const wh = new Set(fresh.wheels || []);
+  for (let i = 73; i < 221; i++) wh.add(i);
+  const it = [...(fresh.integers || [])];
   while (it.length < 113) it.push(0);
   for (const i of [0,1,2,3,4,5,110,111,112]) it[i] = 1;
-  updated.integers = it;
-  return cpm1Save(token, uid, updated, rec);
+  return cpm1ModifyAndSave(token, uid, { wheels: [...wh], integers: it });
 }
 
 async function cpm1CompleteLevels(token, uid, rec) {
   const lvl = [0];
   for (let i = 1; i < 110; i++) lvl.push(i === 43 ? 120 : 1);
-  return cpm1Save(token, uid, { ...rec, LevelsDoneTime: lvl }, rec);
+  return cpm1ModifyAndSave(token, uid, { LevelsDoneTime: lvl });
 }
 
 async function cpm1FixAccount(token, uid, rec) {
-  const updated = JSON.parse(JSON.stringify(rec));
-  const fl = [...(updated.floats || [])].slice(0, 54);
+  const fresh = await cpm1Load(token, uid) || rec;
+  const fl = [...(fresh.floats || [])].slice(0, 54);
   while (fl.length < 54) fl.push(0);
   let bugs = 0;
-  updated.floats = fl.map(v => { if (v > 1) { bugs++; return 0; } return v === 1 ? 1 : 0; });
-  const it = [...(updated.integers || [])].slice(0, 120);
+  const fixedFl = fl.map(v => { if (v > 1) { bugs++; return 0; } return v === 1 ? 1 : 0; });
+  const it = [...(fresh.integers || [])].slice(0, 120);
   while (it.length < 120) it.push(0);
-  updated.integers = it.map(v => { if (v > 1) { bugs++; return 0; } return v === 1 ? 1 : 0; });
-  const ok = await cpm1Save(token, uid, updated, rec);
+  const fixedIt = it.map(v => { if (v > 1) { bugs++; return 0; } return v === 1 ? 1 : 0; });
+  const ok = await cpm1ModifyAndSave(token, uid, { floats: fixedFl, integers: fixedIt });
   return { ok, bugs };
 }
 
@@ -468,6 +480,14 @@ const SessionSchema = new mongoose.Schema({
   updatedAt: { type: Date, default: Date.now, expires: 3600 }
 });
 const SessionStore = mongoose.model('SessionStore', SessionSchema);
+
+// CPM1 access control
+const Cpm1AccessSchema = new mongoose.Schema({ userId: { type: String, unique: true }, grantedBy: String, grantedAt: { type: Date, default: Date.now } });
+const Cpm1Access = mongoose.model('Cpm1Access', Cpm1AccessSchema);
+async function hasCpm1Access(userId) {
+  if (ADMIN_IDS.includes(String(userId))) return true;
+  return !!(await Cpm1Access.findOne({ userId: String(userId) }).catch(() => null));
+}
 
 
 async function isBanned(userId) {
@@ -3009,6 +3029,12 @@ function c1Dashboard(sess) {
 bot.onText(/^\/cpm1$/, async (msg) => {
   const chatId = msg.chat.id;
   const uid = msg.from.id;
+  if (!(await hasCpm1Access(uid))) {
+    return bot.sendMessage(chatId,
+      '🚫 *CPM1 Access Required*\n\nContact the admin to get access to the CPM1 tool.',
+      { parse_mode: 'Markdown' }
+    );
+  }
   const sess = C1S[uid];
   if (sess) {
     bot.sendMessage(chatId, c1Dashboard(sess), { reply_markup: c1KB.home() });
@@ -3326,6 +3352,14 @@ bot.on('callback_query', async (query) => {
   const uid    = query.from.id;
 
   if (query.data === 'pick_cpm1') {
+    if (!(await hasCpm1Access(uid))) {
+      await bot.editMessageText(
+        '🚫 *CPM1 Access Required*\n\nContact the admin to get access to the CPM1 tool.\n\nUse /cpm2 for the CPM2 store.',
+        { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: [[{ text: '◂ Back', callback_data: 'pick_back' }]] } }
+      ).catch(() => {});
+      return bot.answerCallbackQuery(query.id, { text: '🚫 No access' }).catch(() => {});
+    }
     const sess = cpm1Sessions[uid];
     const txt = sess
       ? c1Dashboard(sess)
@@ -3388,4 +3422,75 @@ Welcome! Choose your game:`,
     ).catch(() => {});
     return bot.answerCallbackQuery(query.id).catch(() => {});
   }
+});
+
+/* ── CPM1 Access Admin Commands ── */
+
+// /cpm1grant <userId or @username>
+bot.onText(/^\/cpm1grant(?:\s+(\S+))?$/, async (msg, match) => {
+  if (!isAdmin(msg)) return bot.sendMessage(msg.chat.id, '🚫 Admin only.');
+  const chatId = msg.chat.id;
+  const raw = (match[1] || '').replace('@', '').trim();
+  if (!raw) return bot.sendMessage(chatId, 'Usage: /cpm1grant <userId>');
+  try {
+    await Cpm1Access.findOneAndUpdate(
+      { userId: raw },
+      { userId: raw, grantedBy: String(msg.from.id), grantedAt: new Date() },
+      { upsert: true }
+    );
+    bot.sendMessage(chatId, `✅ CPM1 access granted to \`${raw}\``, { parse_mode: 'Markdown' });
+    // Notify the user
+    bot.sendMessage(raw,
+      '✅ *CPM1 Access Granted!*\n\nYou now have access to the CPM1 tool.\nUse /cpm1 or /start to begin.',
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Error: ' + e.message);
+  }
+});
+
+// /cpm1revoke <userId>
+bot.onText(/^\/cpm1revoke(?:\s+(\S+))?$/, async (msg, match) => {
+  if (!isAdmin(msg)) return bot.sendMessage(msg.chat.id, '🚫 Admin only.');
+  const chatId = msg.chat.id;
+  const raw = (match[1] || '').replace('@', '').trim();
+  if (!raw) return bot.sendMessage(chatId, 'Usage: /cpm1revoke <userId>');
+  try {
+    await Cpm1Access.deleteOne({ userId: raw });
+    delete cpm1Sessions[raw];
+    delete C1ST[raw];
+    bot.sendMessage(chatId, `✅ CPM1 access revoked from \`${raw}\``, { parse_mode: 'Markdown' });
+  } catch(e) {
+    bot.sendMessage(chatId, '❌ Error: ' + e.message);
+  }
+});
+
+// /cpm1list — list all users with CPM1 access
+bot.onText(/^\/cpm1list$/, async (msg) => {
+  if (!isAdmin(msg)) return bot.sendMessage(msg.chat.id, '🚫 Admin only.');
+  try {
+    const list = await Cpm1Access.find().catch(() => []);
+    if (!list.length) return bot.sendMessage(msg.chat.id, '📋 No users have CPM1 access yet.');
+    const lines = list.map((u, i) =>
+      `${i+1}. \`${u.userId}\` — granted ${new Date(u.grantedAt).toLocaleDateString()}`
+    ).join('\n');
+    bot.sendMessage(msg.chat.id, `📋 *CPM1 Access List (${list.length})*\n\n${lines}`, { parse_mode: 'Markdown' });
+  } catch(e) {
+    bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message);
+  }
+});
+
+// /cpm1access — admin shortcut panel
+bot.onText(/^\/cpm1access$/, async (msg) => {
+  if (!isAdmin(msg)) return bot.sendMessage(msg.chat.id, '🚫 Admin only.');
+  const list = await Cpm1Access.find().catch(() => []);
+  bot.sendMessage(msg.chat.id,
+    `🔐 *CPM1 Access Panel*\n\n` +
+    `👥 Users with access: *${list.length}*\n\n` +
+    `*Commands:*\n` +
+    `\`/cpm1grant <userId>\` — Grant access\n` +
+    `\`/cpm1revoke <userId>\` — Revoke access\n` +
+    `\`/cpm1list\` — List all users`,
+    { parse_mode: 'Markdown' }
+  );
 });
