@@ -1,6 +1,326 @@
 const TelegramBot = require('node-telegram-bot-api');
 const http = require('http');
 const mongoose = require('mongoose');
+const zlib = require('zlib');
+const { promisify } = require('util');
+
+/* ═══════════════════════════════════
+   CPM1 ENGINE (inline)
+═══════════════════════════════════ */
+const brotliDecompress = promisify(zlib.brotliDecompress);
+const brotliCompress   = promisify(zlib.brotliCompress);
+const inflateRaw       = promisify(zlib.inflateRaw);
+const gunzip           = promisify(zlib.gunzip);
+
+const CPM1_FK    = 'AIzaSyBW1ZbMiUeDZHYUO2bY8Bfnf5rRgrQGPTM';
+const CPM1_LOGIN = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${CPM1_FK}`;
+const CPM1_LOAD  = 'https://europe-west1-cp-multiplayer.cloudfunctions.net/GetPlayerRecords3';
+const CPM1_SAVE  = 'https://europe-west1-cp-multiplayer.cloudfunctions.net/SavePlayerRecordsPartially8';
+const CPM1_RANK  = 'https://europe-west1-cp-multiplayer.cloudfunctions.net/SetUserRating7';
+const CPM1_MAX_MONEY = 50_000_000;
+const CPM1_MAX_COIN  = 500_000;
+
+const CPM1_GAME_HEADERS = {
+  'Accept': '*/*', 'Accept-Encoding': 'gzip', 'Content-Type': 'application/json',
+  'User-Agent': 'UnityPlayer/2022.3.62f2 (UnityWebRequest/1.0, libcurl/8.10.1-DEV)',
+  'X-Unity-Version': '2022.3.62f2',
+};
+
+function makeCpm1Key(uid) {
+  const c = [...uid];
+  if (c.length >= 9) [c[1], c[8]] = [c[8], c[1]];
+  if (c.length >= 3) c.splice(2, 1);
+  if (c.length >= 5) c.push(c[4]);
+  return Buffer.from(c.join(''), 'utf8');
+}
+
+function cpm1Xor(data, key) {
+  const r = Buffer.alloc(data.length);
+  for (let i = 0; i < data.length; i++) r[i] = data[i] ^ key[i % key.length];
+  return r;
+}
+
+async function cpm1Decompress(buf) {
+  for (const fn of [brotliDecompress, gunzip, inflateRaw]) {
+    try { const r = await fn(buf); if (r?.length > 0) return r; } catch {}
+  }
+  return null;
+}
+
+class Cpm1Reader {
+  constructor(buf) { this.buf = buf; this.pos = 0; }
+  ok(n) { return this.pos + n <= this.buf.length; }
+  readByte() { return this.ok(1) ? this.buf[this.pos++] : 0; }
+  readInt()  { if (!this.ok(4)) { this.pos = this.buf.length; return 0; } const v = this.buf.readInt32LE(this.pos); this.pos += 4; return v; }
+  readFloat(){ if (!this.ok(4)) { this.pos = this.buf.length; return 0; } const v = this.buf.readFloatLE(this.pos); this.pos += 4; return v; }
+  readString() {
+    const m = this.readInt();
+    if (m === 0 || m === -1) return '';
+    let len = m < -1 ? ((-m) - 1) : m;
+    if (m < -1) this.readInt();
+    if (len > 1e6) len = 1e6;
+    if (!this.ok(len)) return '';
+    const t = this.buf.slice(this.pos, this.pos + len).toString('utf8');
+    this.pos += len;
+    return t.replace(/\x00/g,'').trim();
+  }
+  readList(fn) {
+    const n = this.readInt();
+    if (n <= 0 || n > 1e6) return [];
+    const a = [];
+    for (let i = 0; i < n && this.pos < this.buf.length; i++) { const v = fn(); if (v != null) a.push(v); }
+    return a;
+  }
+  readDict() {
+    const n = this.readInt(); if (n <= 0 || n > 1e6) return {};
+    const d = {};
+    for (let i = 0; i < n && this.pos < this.buf.length; i++) d[this.readInt()] = this.readInt();
+    return d;
+  }
+  readEquipment() {
+    if (this.readByte() === 0) return null;
+    const keys = ['hair','face','beard','cap','mask','top','gloves','bag','pants','shoes','glasses','SelectedEquipments'];
+    const e = {};
+    for (const k of keys) e[k] = this.readList(() => this.readInt());
+    e.Gender = this.readInt();
+    return e;
+  }
+}
+
+function cpm1ParsePlayer(buf) {
+  const r = new Cpm1Reader(buf);
+  if (r.readByte() === 0) return null;
+  const p = {};
+  p.Name = r.readString(); p.money = r.readInt(); p.coin = r.readInt(); p.localID = r.readString();
+  p.boughtFsos = r.readList(() => r.readInt());
+  p.FriendsID = r.readList(() => { r.readByte(); return { id: r.readString(), Name: r.readString(), accountID: r.readString() }; });
+  p.LevelsDoneTime = r.readList(() => r.readFloat());
+  p.floats = r.readList(() => r.readFloat());
+  p.integers = r.readList(() => r.readInt());
+  p.fcar = r.readList(() => r.readInt());
+  p.favouriteWheels = r.readList(() => r.readInt());
+  p.favouriteVinyls = r.readList(() => r.readInt());
+  p.favouriteEmojis = r.readList(() => r.readInt());
+  p.personEquipmentsMale = r.readEquipment();
+  p.personEquipmentsFemale = r.readEquipment();
+  if (r.readByte() === 0) { p.platesData = null; } else {
+    const rv = () => { r.readByte(); return { vectors: r.readList(() => ({x:r.readFloat(),y:r.readFloat(),z:r.readFloat()})), v: r.readList(() => r.readString()), floats: r.readList(() => r.readFloat()), text: r.readString() }; };
+    const rp = () => { r.readByte(); return { plateId: r.readInt(), frontCarId: r.readInt(), rearCarId: r.readInt(), vinyls: r.readList(rv) }; };
+    p.platesData = { allPlates: r.readList(rp) };
+  }
+  if (r.readByte() === 0) { p.carIDnStatus = null; } else { p.carIDnStatus = { carGeneratedIDs: r.readList(() => r.readString()), carStatus: r.readList(() => r.readInt()) }; }
+  p.allData = r.readString(); p.flags = r.readDict();
+  p.animations = r.readList(() => r.readInt()); p.emojiPacks = r.readList(() => r.readInt());
+  p.wheels = r.readList(() => r.readInt()); p.boughtPoliceLights = r.readList(() => r.readInt());
+  p.boughtPoliceSirens = r.readList(() => r.readInt());
+  return p;
+}
+
+async function cpm1DecryptRecord(b64, uid) {
+  let buf; try { buf = Buffer.from(b64, 'base64'); } catch { return null; }
+  if (buf.length < 10) return null;
+  const tryParse = async (b) => {
+    if (!b) return null;
+    if ([17,23,24].includes(b[0])) { try { const p = cpm1ParsePlayer(b); if (p?.Name !== undefined) return p; } catch {} }
+    try { if (b[0] === 123) return JSON.parse(b.toString('utf8')); } catch {}
+    return null;
+  };
+  let p = await tryParse(buf); if (p) return p;
+  const d1 = await cpm1Decompress(buf); if (d1) { p = await tryParse(d1); if (p) return p; }
+  const key = makeCpm1Key(uid); const xored = cpm1Xor(buf, key);
+  const d2 = await cpm1Decompress(xored); if (d2) { p = await tryParse(d2); if (p) return p; }
+  return null;
+}
+
+class Cpm1Writer {
+  constructor() { this._p = []; }
+  writeByte(v) { const b = Buffer.alloc(1); b[0] = v & 0xFF; this._p.push(b); }
+  writeInt(v)  { const b = Buffer.alloc(4); b.writeInt32LE(v||0); this._p.push(b); }
+  writeFloat(v){ const b = Buffer.alloc(4); b.writeFloatLE(v||0); this._p.push(b); }
+  writeString(s) {
+    if (s == null) { this.writeInt(-1); return; }
+    s = String(s); if (!s) { this.writeInt(0); return; }
+    const enc = Buffer.from(s,'utf8'); const a = Buffer.alloc(8);
+    a.writeInt32LE(-(enc.length)-1,0); a.writeInt32LE(s.length,4);
+    this._p.push(a,enc);
+  }
+  writeList(lst, fn) { if (!lst) { this.writeInt(-1); return; } const b = Buffer.alloc(4); b.writeInt32LE(lst.length); this._p.push(b); for (const x of lst) fn(x); }
+  writeEquipment(d) {
+    if (!d) { this.writeByte(0); return; } this.writeByte(13);
+    for (const k of ['hair','face','beard','cap','mask','top','gloves','bag','pants','shoes','glasses','SelectedEquipments']) this.writeList(d[k]||[], v => this.writeInt(v));
+    this.writeInt(d.Gender||0);
+  }
+  writePlates(d) {
+    if (!d) { this.writeByte(0); return; } this.writeByte(1);
+    const pl = d.allPlates||[]; const c = Buffer.alloc(4); c.writeInt32LE(pl.length); this._p.push(c);
+    for (const p of pl) {
+      this.writeByte(4); this.writeInt(p.plateId||0); this.writeInt(p.frontCarId||0); this.writeInt(p.rearCarId||0);
+      const vc = Buffer.alloc(4); vc.writeInt32LE((p.vinyls||[]).length); this._p.push(vc);
+      for (const v of (p.vinyls||[])) {
+        this.writeByte(4); const vecs = v.vectors||[]; const vc2 = Buffer.alloc(4); vc2.writeInt32LE(vecs.length); this._p.push(vc2);
+        for (const vec of vecs) { const vb = Buffer.alloc(12); vb.writeFloatLE(vec.x||0,0); vb.writeFloatLE(vec.y||0,4); vb.writeFloatLE(vec.z||0,8); this._p.push(vb); }
+        this.writeList(v.v||[], s => this.writeString(s)); this.writeList(v.floats||[], f => this.writeFloat(f)); this.writeString(v.text||'');
+      }
+    }
+  }
+  writeCarIDs(d) {
+    if (!d) { this.writeByte(0); return; } this.writeByte(2);
+    this.writeList(d.carGeneratedIDs||[], s => this.writeString(s)); this.writeList(d.carStatus||[], v => this.writeInt(v));
+  }
+  toBuffer() { return Buffer.concat(this._p); }
+}
+
+const CPM1_INT_LISTS   = new Set([6,7,8,12,13,14,15,16,18,46,48]);
+const CPM1_FLOAT_LISTS = new Set([10,11]);
+const CPM1_FIELDS = [[1,'localID'],[2,'money'],[3,'Name'],[4,'coin'],[5,'allData'],[6,'boughtFsos'],[7,'boughtPoliceLights'],[8,'boughtPoliceSirens'],[9,'FriendsID'],[10,'LevelsDoneTime'],[11,'floats'],[12,'integers'],[13,'fcar'],[14,'favouriteWheels'],[15,'favouriteVinyls'],[16,'favouriteEmojis'],[18,'emojiPacks'],[41,'personEquipmentsMale'],[42,'personEquipmentsFemale'],[43,'platesData'],[44,'carIDnStatus'],[45,'flags'],[46,'animations'],[48,'wheels']];
+
+function cpm1SerField(fid, val) {
+  const w = new Cpm1Writer();
+  if ([1,3,5].includes(fid)) { w.writeString(val); return w.toBuffer(); }
+  if ([2,4].includes(fid))   { w.writeInt(val||0); return w.toBuffer(); }
+  if (fid === 9) {
+    const fr = val||[]; const c = Buffer.alloc(4); c.writeInt32LE(fr.length); w._p.push(c);
+    for (const f of fr) { w.writeByte(3); w.writeString((f||{}).id||''); w.writeString((f||{}).Name||''); w.writeString((f||{}).accountID||''); }
+    return w.toBuffer();
+  }
+  if (CPM1_INT_LISTS.has(fid))   { w.writeList(val||[], v => w.writeInt(v));   return w.toBuffer(); }
+  if (CPM1_FLOAT_LISTS.has(fid)) { w.writeList(val||[], v => w.writeFloat(v)); return w.toBuffer(); }
+  if ([41,42].includes(fid)) { w.writeEquipment(val); return w.toBuffer(); }
+  if (fid === 43) { w.writePlates(val); return w.toBuffer(); }
+  if (fid === 44) { w.writeCarIDs(val); return w.toBuffer(); }
+  if (fid === 45) {
+    const en = Object.entries(val||{}); const c = Buffer.alloc(4); c.writeInt32LE(en.length); w._p.push(c);
+    for (const [k,v] of en) { w.writeInt(parseInt(k)); w.writeInt(parseInt(v)); }
+    return w.toBuffer();
+  }
+  return null;
+}
+
+async function cpm1BuildPayload(rec, uid, orig) {
+  const fields = [];
+  for (const [fid, key] of CPM1_FIELDS) {
+    const val = rec[key]; if (val == null) continue;
+    const changed = key === 'allData' ? (typeof val === 'string' && val.length > 0)
+      : (orig ? JSON.stringify(val) !== JSON.stringify(orig[key]) : true);
+    if (!changed) continue;
+    const raw = cpm1SerField(fid, val); if (raw) fields.push([fid, raw]);
+  }
+  const hdr = Buffer.alloc(4); hdr.writeInt32LE(fields.length);
+  const parts = [hdr];
+  for (const [fid, raw] of fields) { const m = Buffer.alloc(6); m.writeInt16LE(fid,0); m.writeInt32LE(raw.length,2); parts.push(m,raw); }
+  const comp = await brotliCompress(Buffer.concat(parts));
+  return cpm1Xor(comp, makeCpm1Key(uid)).toString('base64');
+}
+
+async function cpm1Post(url, body, token) {
+  const h = { ...CPM1_GAME_HEADERS }; if (token) h['Authorization'] = `Bearer ${token}`;
+  const r = await fetch(url, { method:'POST', headers:h, body:JSON.stringify(body) });
+  return r.json().catch(() => null);
+}
+
+async function cpm1Login(email, password) {
+  const r = await cpm1Post(CPM1_LOGIN, { email, password, returnSecureToken:true, clientType:'CLIENT_TYPE_ANDROID' });
+  if (!r) return { ok:false, msg:'Network error' };
+  if (r.idToken) return { ok:true, token:r.idToken, uid:r.localId };
+  const e = (r.error?.message||'').toUpperCase();
+  return { ok:false, msg: e || 'Login failed' };
+}
+
+async function cpm1Load(token, uid) {
+  const r = await cpm1Post(CPM1_LOAD, { data:null }, token);
+  if (!r?.result) return null;
+  return cpm1DecryptRecord(r.result, uid);
+}
+
+async function cpm1Save(token, uid, rec, orig) {
+  const payload = await cpm1BuildPayload(rec, uid, orig);
+  const r = await cpm1Post(CPM1_SAVE, { data:{ data:payload, deviceId:uid.slice(0,8) } }, token);
+  const v = r?.result ?? r?.ok ?? r?.success;
+  return v === 1 || v === true || v === '1';
+}
+
+async function cpm1SetRank(token) {
+  const rd = { RatingData: { time:1e10,cars:1e5,car_fix:1e5,car_collided:1e5,car_exchange:1e5,car_trade:1e5,car_wash:1e5,slicer_cut:1e5,drift_max:1e6,drift:1e6,cargo:1e5,delivery:1e5,race_win:3000,taxi:1e5,levels:1e6,gifts:1e5,fuel:1e5,offroad:1e5,speed_banner:1e5,reactions:1e5,police:1e5,run:1e5,real_estate:1e5,t_distance:1e5,treasure:1e5,block_post:1e5,push_ups:1e5,burnt_tire:1e5,passanger_distance:1e5 } };
+  const r = await cpm1Post(CPM1_RANK, { data:JSON.stringify(rd) }, token);
+  return !!(r?.result === 1 || r?.ok === true);
+}
+
+async function cpm1SetFloats(token, uid, rec, idxVals) {
+  const updated = JSON.parse(JSON.stringify(rec));
+  const fl = [...(updated.floats || [])];
+  const maxIdx = Math.max(...idxVals.map(([i]) => i));
+  while (fl.length <= maxIdx) fl.push(0);
+  for (const [idx, val] of idxVals) fl[idx] = val;
+  updated.floats = fl;
+  return cpm1Save(token, uid, updated, rec);
+}
+
+async function cpm1SetIntegers(token, uid, rec, idxVals) {
+  const updated = JSON.parse(JSON.stringify(rec));
+  const it = [...(updated.integers || [])];
+  const maxIdx = Math.max(...idxVals.map(([i]) => i));
+  while (it.length <= maxIdx) it.push(0);
+  for (const [idx, val] of idxVals) it[idx] = val;
+  updated.integers = it;
+  return cpm1Save(token, uid, updated, rec);
+}
+
+async function cpm1UnlockW16(token, uid, rec)       { return cpm1SetFloats(token, uid, rec, [[32, 1]]); }
+async function cpm1UnlockHorns(token, uid, rec)     { return cpm1SetFloats(token, uid, rec, [[27,1],[28,1],[29,1],[30,1],[31,1]]); }
+async function cpm1DisableDamage(token, uid, rec)   { return cpm1SetFloats(token, uid, rec, [[34, 1]]); }
+async function cpm1UnlimitedFuel(token, uid, rec)   { return cpm1SetFloats(token, uid, rec, [[3, 1]]); }
+async function cpm1UnlockSmoke(token, uid, rec)     { return cpm1SetFloats(token, uid, rec, [[33, 1]]); }
+async function cpm1SetWins(token, uid, rec, n)      { return cpm1SetFloats(token, uid, rec, [[8, parseFloat(n)]]); }
+async function cpm1SetLoses(token, uid, rec, n)     { return cpm1SetFloats(token, uid, rec, [[9, parseFloat(n)]]); }
+async function cpm1UnlockHouses(token, uid, rec)    { return cpm1SetIntegers(token, uid, rec, [[8,1],[110,1],[111,1],[112,1]]); }
+
+async function cpm1SetName(token, uid, rec, name) {
+  return cpm1Save(token, uid, { ...rec, Name: name }, rec);
+}
+async function cpm1SetPlayerID(token, uid, rec, pid) {
+  return cpm1Save(token, uid, { ...rec, localID: pid.toUpperCase() }, rec);
+}
+
+async function cpm1UnlockAnimations(token, uid, rec) {
+  const updated = JSON.parse(JSON.stringify(rec));
+  const existing = new Set(updated.animations || []);
+  for (let i = 0; i < 301; i++) existing.add(i);
+  updated.animations = [...existing];
+  return cpm1Save(token, uid, updated, rec);
+}
+
+async function cpm1UnlockWheels(token, uid, rec) {
+  const updated = JSON.parse(JSON.stringify(rec));
+  const existing = new Set(updated.wheels || []);
+  for (let i = 73; i < 221; i++) existing.add(i);
+  updated.wheels = [...existing];
+  const it = [...(updated.integers || [])];
+  while (it.length < 113) it.push(0);
+  for (const i of [0,1,2,3,4,5,110,111,112]) it[i] = 1;
+  updated.integers = it;
+  return cpm1Save(token, uid, updated, rec);
+}
+
+async function cpm1CompleteLevels(token, uid, rec) {
+  const lvl = [0];
+  for (let i = 1; i < 110; i++) lvl.push(i === 43 ? 120 : 1);
+  return cpm1Save(token, uid, { ...rec, LevelsDoneTime: lvl }, rec);
+}
+
+async function cpm1FixAccount(token, uid, rec) {
+  const updated = JSON.parse(JSON.stringify(rec));
+  const fl = [...(updated.floats || [])].slice(0, 54);
+  while (fl.length < 54) fl.push(0);
+  let bugs = 0;
+  updated.floats = fl.map(v => { if (v > 1) { bugs++; return 0; } return v === 1 ? 1 : 0; });
+  const it = [...(updated.integers || [])].slice(0, 120);
+  while (it.length < 120) it.push(0);
+  updated.integers = it.map(v => { if (v > 1) { bugs++; return 0; } return v === 1 ? 1 : 0; });
+  const ok = await cpm1Save(token, uid, updated, rec);
+  return { ok, bugs };
+}
+
+const cpm1Sessions = {};
 
 /* Render keepalive */
 const PORT = process.env.PORT || 3000;
@@ -344,97 +664,6 @@ async function apiAdminAccounts() {
     throw new Error('🔌 Server offline: ' + e.message);
   }
 }
-
-/* Updates a single account's stored credentials.
-   REQUIRES a matching endpoint on your server — if you don't have one yet, add:
-     PATCH /api/admin/accounts/:ref   (header: x-admin-key)
-     body: { "claimedEmail": "..." }  OR  { "claimedPassword": "..." }
-   Have it find the account by ref, set whichever field was sent, save, and
-   respond with { ok: true }. */
-async function apiAdminUpdateAccount(ref, updates) {
-  try {
-    const r = await fetch(`${SERVER_URL}/api/admin/accounts/${encodeURIComponent(ref)}`, {
-      method: 'PATCH',
-      headers: { 'x-admin-key': ADMIN_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify(updates)
-    });
-    if (!r.ok) return { ok: false, msg: `Server returned ${r.status} — you likely need to add this endpoint, see the comment above apiAdminUpdateAccount() in bot.js` };
-    return r.json();
-  } catch (e) {
-    return { ok: false, msg: '🔌 Server offline: ' + e.message };
-  }
-}
-
-/* Any of these field names found on an account record will be shown on the /acc detail card. */
-const CREDENTIAL_DISPLAY_KEYS = ['claimedEmail', 'claimedPassword', 'email', 'password', 'originalEmail', 'originalPassword'];
-
-function buildAccountDetailCard(acc) {
-  let text = `╔══════════════════╗\n  📄 *ACCOUNT DETAILS*\n╚══════════════════╝\n\n`;
-  text += `🔖 Ref: \`${acc.ref}\`\n`;
-  text += `${statusEmoji(acc.status)} Status: *${acc.status}*\n\n`;
-
-  let foundAny = false;
-  const seen = new Set();
-  for (const key of CREDENTIAL_DISPLAY_KEYS) {
-    const lower = key.toLowerCase();
-    const bucket = lower.includes('pass') ? 'pass' : 'mail';
-    if (acc[key] && !seen.has(bucket)) {
-      foundAny = true;
-      seen.add(bucket);
-      const label = bucket === 'pass' ? '🔑 Password' : '📧 Email';
-      text += `${label}: \`${acc[key]}\`\n`;
-    }
-  }
-  if (!foundAny) {
-    text += `⚠️ No email/password on this record.\nEither it's unclaimed, or your /api/admin/accounts endpoint doesn't return credential fields yet — check what field names your server actually uses and add them to CREDENTIAL_DISPLAY_KEYS near the top of this block in bot.js.\n`;
-  }
-
-  const buttons = [
-    [{ text: '✏️ Edit Email', callback_data: `acc_edit_email:${acc.ref}` }, { text: '✏️ Edit Password', callback_data: `acc_edit_pass:${acc.ref}` }],
-  ];
-  return { text, buttons };
-}
-
-const adminEditSessions = {}; // chatId -> { ref, field }
-
-bot.onText(/^\/acc (\S+)$/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
-  const ref = match[1];
-  try {
-    const accs = await apiAdminAccounts();
-    const found = Array.isArray(accs) ? accs.find(a => a.ref === ref) : null;
-    if (!found) return bot.sendMessage(chatId, `❌ No account found with ref \`${ref}\`.`, { parse_mode: 'Markdown' });
-    const { text, buttons } = buildAccountDetailCard(found);
-    bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
-  } catch (e) {
-    bot.sendMessage(chatId, '❌ ' + e.message);
-  }
-});
-
-/* Catches the admin's reply after they tap Edit Email / Edit Password on an /acc card. */
-bot.on('message', async (msg) => {
-  const chatId = msg.chat.id;
-  const editSession = adminEditSessions[chatId];
-  if (!editSession || !msg.text) return;
-  if (!isAdmin(msg)) return; // shouldn't happen, session is only ever set for admins
-
-  if (msg.text === '/cancel') {
-    delete adminEditSessions[chatId];
-    return bot.sendMessage(chatId, '❌ Edit cancelled.');
-  }
-
-  const newValue = msg.text.trim();
-  const serverField = editSession.field === 'email' ? 'claimedEmail' : 'claimedPassword';
-  const result = await apiAdminUpdateAccount(editSession.ref, { [serverField]: newValue });
-  delete adminEditSessions[chatId];
-
-  if (result.ok === false) {
-    return bot.sendMessage(chatId, `❌ Update failed: ${result.msg}`);
-  }
-  log(msg, 'acc:edit', `ref=${editSession.ref} field=${editSession.field}`, 'ok');
-  bot.sendMessage(chatId, `✅ Updated ${editSession.field} for \`${editSession.ref}\`.`, { parse_mode: 'Markdown' });
-});
 async function apiAdminStats() {
   try {
     const r = await fetch(`${SERVER_URL}/api/admin/stats`, { headers: { 'x-admin-key': ADMIN_KEY } });
@@ -676,30 +905,15 @@ bot.onText(/^\/start(?:\s+(.+))?$/, async (msg, match) => {
    🎮  *KALYPO MODS*  🎮
 ╚═══════════════════╝
 
-*CPM2 Premium Account Store*
-
-┌─────────────────────┐
-│  💎  *WHAT YOU GET*  💎  │
-├─────────────────────┤
-│ 🪙  300 Coins            │
-│ 🚗  10–20 Cars           │
-│ 👑  King Rank             │
-│ 🔓  All Cars Unlocked  │
-│ 🎨  All Paintings         │
-│ 💡  All Headlights        │
-│ 👕  Full Clothes Set      │
-│ 🎬  All Animations        │
-└─────────────────────┘
-
-💰 Price: *${PRICE_COINS} Coins* per account`,
+Welcome! Choose your game:`,
     {
       parse_mode: 'Markdown',
       reply_markup: {
         inline_keyboard: [
-          [{ text: '💳 Payment Info', callback_data: 'menu_pay' },   { text: '🪙 My Wallet',  callback_data: 'menu_wallet' }],
-          [{ text: '🎮 Claim Account', callback_data: 'menu_claim' }, { text: '🔑 Buy Ref',    callback_data: 'menu_buyref' }],
-          [{ text: '🏆 Leaderboard',  callback_data: 'menu_top' },   { text: '🏅 My Rank',    callback_data: 'menu_rank'   }],
-          [{ text: '📟 Full Menu',    callback_data: 'menu_full' }]
+          [
+            { text: '🚗 CPM 1 Tool',  callback_data: 'pick_cpm1' },
+            { text: '🏎 CPM 2 Store', callback_data: 'pick_cpm2' },
+          ]
         ]
       }
     }
@@ -1502,69 +1716,6 @@ bot.onText(/^\/validate(?: (all|available))?$/, async (msg, match) => {
   }
 });
 
-let bulkEditLock = false;
-const pendingBulkEdits = {}; // chatId -> { start, end, password, ts }
-
-async function runBulkEditRefs(chatId, start, end, password) {
-  const total = end - start + 1;
-  let ok = 0, fail = 0;
-  const failList = [];
-
-  const progressMsg = await bot.sendMessage(chatId, `🔄 Updating *0/${total}* accounts...`, { parse_mode: 'Markdown' }).catch(() => null);
-
-  for (let i = start; i <= end; i++) {
-    const ref = String(i);
-    const result = await apiAdminUpdateAccount(ref, { claimedPassword: password });
-    if (result.ok === false) { fail++; failList.push({ ref, reason: result.msg || 'failed' }); }
-    else ok++;
-
-    const done = i - start + 1;
-    if (progressMsg && (done % 25 === 0 || done === total)) {
-      bot.editMessageText(`🔄 Updating *${done}/${total}* accounts... (✅ ${ok}  ❌ ${fail})`, {
-        chat_id: chatId, message_id: progressMsg.message_id, parse_mode: 'Markdown'
-      }).catch(() => {});
-    }
-    await new Promise(res => setTimeout(res, 200));
-  }
-
-  let text = `╔══════════════════╗\n  ✅  *BULK EDIT COMPLETE*\n╚══════════════════╝\n\n`;
-  text += `📦 Range: ref \`${start}\` to \`${end}\` (${total} total)\n`;
-  text += `🟢 Updated: *${ok}*\n`;
-  text += `🔴 Failed: *${fail}*\n\n`;
-  if (failList.length) {
-    text += `*🔴 Failed refs:*\n`;
-    failList.slice(0, 25).forEach(f => { text += `• \`${f.ref}\` — ${f.reason}\n`; });
-    if (failList.length > 25) text += `_...and ${failList.length - 25} more_\n`;
-  }
-  await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' }).catch(() => {});
-}
-
-bot.onText(/^\/editref (\d+):(\d+) (.+)$/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
-  if (bulkEditLock) return bot.sendMessage(chatId, '⏳ A bulk edit is already in progress. Wait for it to finish.');
-
-  let start = parseInt(match[1]), end = parseInt(match[2]);
-  const password = match[3].trim();
-  if (start > end) [start, end] = [end, start];
-  const total = end - start + 1;
-
-  if (total > 2000) {
-    return bot.sendMessage(chatId, `⚠️ That's ${total} accounts — capped at 2000 per run for safety. Split it into smaller batches.`);
-  }
-
-  pendingBulkEdits[chatId] = { start, end, password, ts: Date.now() };
-  const preview = password.length <= 4 ? password : password.slice(0, 2) + '•'.repeat(password.length - 2);
-  bot.sendMessage(chatId,
-    `⚠️ *Confirm bulk edit*\n\nSet password to \`${preview}\` for refs \`${start}\`–\`${end}\` (*${total} accounts*)?\n\nThis overwrites the existing password on every one of them.`,
-    { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[
-      { text: '✅ Confirm', callback_data: 'bulkedit_confirm' },
-      { text: '❌ Cancel', callback_data: 'bulkedit_cancel' }
-    ]] } }
-  );
-  log(msg, '/editref', `range=${start}:${end} count=${total}`, 'info');
-});
-
 bot.onText(/^\/reset (.+)$/, async (msg, match) => {
   const chatId = msg.chat.id;
   if (!isAdmin(msg)) return bot.sendMessage(chatId, '🚫 Admin only.');
@@ -1811,37 +1962,6 @@ Then use /buyref → /claim to get your account.`,
   if (data === 'adm_validate') {
     if (!isAdmin(query)) return rejectAdminOnly();
     fakeMsg(query, '/validate'); return;
-  }
-  if (data.startsWith('acc_edit_email:') || data.startsWith('acc_edit_pass:')) {
-    if (!isAdmin(query)) return rejectAdminOnly();
-    const sepIdx = data.indexOf(':');
-    const prefix = data.slice(0, sepIdx);
-    const ref = data.slice(sepIdx + 1);
-    const field = prefix === 'acc_edit_email' ? 'email' : 'password';
-    adminEditSessions[chatId] = { ref, field };
-    bot.sendMessage(chatId, `✏️ Send the new ${field} for \`${ref}\` (or /cancel):`, { parse_mode: 'Markdown' });
-    return;
-  }
-  if (data === 'bulkedit_confirm' || data === 'bulkedit_cancel') {
-    if (!isAdmin(query)) return rejectAdminOnly();
-    const pending = pendingBulkEdits[chatId];
-    delete pendingBulkEdits[chatId];
-    if (!pending) return bot.sendMessage(chatId, '⚠️ That confirmation expired. Run /editref again.');
-    if (data === 'bulkedit_cancel') return bot.sendMessage(chatId, '❌ Bulk edit cancelled.');
-    if (Date.now() - pending.ts > 5 * 60 * 1000) return bot.sendMessage(chatId, '⚠️ That confirmation expired (5 min). Run /editref again.');
-    if (bulkEditLock) return bot.sendMessage(chatId, '⏳ A bulk edit is already in progress.');
-
-    bulkEditLock = true;
-    bot.sendMessage(chatId, `▶️ Starting bulk edit for refs ${pending.start}–${pending.end}...`);
-    try {
-      await runBulkEditRefs(chatId, pending.start, pending.end, pending.password);
-      log({ from: query.from, chat: { id: chatId } }, 'editref:done', `range=${pending.start}:${pending.end}`, 'ok');
-    } catch (e) {
-      bot.sendMessage(chatId, '❌ Bulk edit error: ' + e.message);
-    } finally {
-      bulkEditLock = false;
-    }
-    return;
   }
 
   // ── LEADERBOARD pagination ────────────────────────────────────────────────
@@ -2793,3 +2913,479 @@ mongoose.connect(MONGO_URI)
     console.error('❌ MongoDB connection failed:', err.message);
     console.log('🤖 Bot starting without DB persistence...');
   });
+
+/* ═══════════════════════════════════════════════════════════════
+   CPM1 — Full Button UI (Axel-style)
+═══════════════════════════════════════════════════════════════ */
+
+const C1S  = cpm1Sessions;   // alias
+const C1ST = {};              // step state: { [uid]: { step, data } }
+const CPM1_SEP = '┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅┅';
+
+function c1Fmt(n) { return Number(n||0).toLocaleString(); }
+
+// ── Keyboards ─────────────────────────────────────────────────
+
+const c1KB = {
+  login: () => ({ inline_keyboard: [
+    [{ text: '🔐 Sign In to CPM1', callback_data: 'c1_login' }],
+  ]}),
+
+  home: () => ({ inline_keyboard: [
+    [{ text: '💰 Money', callback_data: 'c1_money_menu' }, { text: '🪙 Coins', callback_data: 'c1_coins_menu' }],
+    [{ text: '⚡ Features', callback_data: 'c1_feat_menu' }, { text: '🔧 Settings', callback_data: 'c1_set_menu' }],
+    [{ text: '🔄 Refresh', callback_data: 'c1_refresh' }],
+    [{ text: '🚪 Sign Out', callback_data: 'c1_logout' }],
+  ]}),
+
+  money: () => ({ inline_keyboard: [
+    [{ text: '$1M',    callback_data: 'c1_m_1000000' },    { text: '$5M',    callback_data: 'c1_m_5000000' },   { text: '$10M', callback_data: 'c1_m_10000000' }],
+    [{ text: '$25M',   callback_data: 'c1_m_25000000' },   { text: '$50M ★', callback_data: 'c1_m_50000000' }],
+    [{ text: '✏️ Custom', callback_data: 'c1_m_custom' }],
+    [{ text: '◂ Back', callback_data: 'c1_home' }],
+  ]}),
+
+  coins: () => ({ inline_keyboard: [
+    [{ text: '100K', callback_data: 'c1_c_100000' }, { text: '250K', callback_data: 'c1_c_250000' }, { text: '500K ★', callback_data: 'c1_c_500000' }],
+    [{ text: '✏️ Custom', callback_data: 'c1_c_custom' }],
+    [{ text: '◂ Back', callback_data: 'c1_home' }],
+  ]}),
+
+  feat: () => ({ inline_keyboard: [
+    [{ text: '🚗 W16 Engine', callback_data: 'c1_f_w16' },   { text: '🔊 Horns',      callback_data: 'c1_f_horns' }],
+    [{ text: '🛡 No Damage',  callback_data: 'c1_f_damage' },{ text: '⛽ Fuel',        callback_data: 'c1_f_fuel' }],
+    [{ text: '💨 Smoke',      callback_data: 'c1_f_smoke' }, { text: '🎭 Animations',  callback_data: 'c1_f_anims' }],
+    [{ text: '🛞 Wheels',     callback_data: 'c1_f_wheels' },{ text: '🏠 Houses',      callback_data: 'c1_f_houses' }],
+    [{ text: '🎮 All Levels', callback_data: 'c1_f_levels' },{ text: '🏅 Max Rank',    callback_data: 'c1_f_rank' }],
+    [{ text: '🚀 ★ UNLOCK ALL ★', callback_data: 'c1_f_all' }],
+    [{ text: '◂ Back', callback_data: 'c1_home' }],
+  ]}),
+
+  settings: () => ({ inline_keyboard: [
+    [{ text: '✏️ Name',   callback_data: 'c1_s_name' }, { text: '🆔 Player ID',  callback_data: 'c1_s_pid' }],
+    [{ text: '🏆 Wins',   callback_data: 'c1_s_wins' }, { text: '😞 Loses',      callback_data: 'c1_s_loses' }],
+    [{ text: '🔧 Fix Account Bugs', callback_data: 'c1_s_fix' }],
+    [{ text: '◂ Back', callback_data: 'c1_home' }],
+  ]}),
+
+  cancel: () => ({ inline_keyboard: [[{ text: '✗ Cancel', callback_data: 'c1_cancel' }]] }),
+  back:   () => ({ inline_keyboard: [[{ text: '◂ Back',  callback_data: 'c1_home' }]] }),
+  confirmLogout: () => ({ inline_keyboard: [[
+    { text: '✔ Yes', callback_data: 'c1_do_logout' },
+    { text: '✗ No',  callback_data: 'c1_home' },
+  ]]}),
+};
+
+// ── Text builders ─────────────────────────────────────────────
+
+function c1Dashboard(sess) {
+  const r = sess.record;
+  const wins   = Math.floor(r.floats?.[8] || 0);
+  const loses  = Math.floor(r.floats?.[9] || 0);
+  const levels = (r.LevelsDoneTime || []).filter(x => x > 0).length;
+  const wheels = (r.wheels || []).length;
+  const anims  = (r.animations || []).length;
+  const friends= (r.FriendsID || []).length;
+  return `${CPM1_SEP}\n  🚗  CPM1 DASHBOARD\n${CPM1_SEP}\n\n` +
+    `  ╭──── ACCOUNT ────╮\n` +
+    `  │ 📧 ${sess.email}\n` +
+    `  │ 👤 ${r.Name || '—'}\n` +
+    `  │ 🆔 ${r.localID || '—'}\n` +
+    `  ╰─────────────────╯\n\n` +
+    `  ╭──── STATS ──────╮\n` +
+    `  │ 💰 $${c1Fmt(r.money)}\n` +
+    `  │ 🪙 ${c1Fmt(r.coin)} coins\n` +
+    `  │ 🏆 ${c1Fmt(wins)}W / ${c1Fmt(loses)}L\n` +
+    `  │ 🎮 ${levels} levels\n` +
+    `  │ 🛞 ${wheels} wheels\n` +
+    `  │ 🎭 ${anims} animations\n` +
+    `  │ 👥 ${friends} friends\n` +
+    `  ╰─────────────────╯\n\n` +
+    `  ▸ Select an option:`;
+}
+
+// ── /cpm1 command ─────────────────────────────────────────────
+
+bot.onText(/^\/cpm1$/, async (msg) => {
+  const chatId = msg.chat.id;
+  const uid = msg.from.id;
+  const sess = C1S[uid];
+  if (sess) {
+    bot.sendMessage(chatId, c1Dashboard(sess), { reply_markup: c1KB.home() });
+  } else {
+    bot.sendMessage(chatId,
+      `${CPM1_SEP}\n  🚗  CPM1 TOOL\n${CPM1_SEP}\n\n  Sign in with your CPM1 credentials\n  to access money, coins, and features.`,
+      { reply_markup: c1KB.login() }
+    );
+  }
+});
+
+// ── Message handler for CPM1 input steps ─────────────────────
+
+bot.on('message', async (msg) => {
+  const uid = msg.from?.id;
+  const chatId = msg.chat?.id;
+  if (!uid || !chatId || !msg.text) return;
+  const st = C1ST[uid];
+  if (!st) return;
+
+  const text = msg.text.trim();
+
+  if (st.step === 'await_email') {
+    if (!text.includes('@') || !text.includes('.')) {
+      return bot.sendMessage(chatId, '✗ Invalid email.', { reply_markup: c1KB.cancel() });
+    }
+    C1ST[uid] = { step: 'await_password', data: { email: text } };
+    return bot.sendMessage(chatId,
+      `${CPM1_SEP}\n  🔑  PASSWORD\n${CPM1_SEP}\n\n  Enter your password:\n  🔒 Message auto-deleted`,
+      { reply_markup: c1KB.cancel() }
+    );
+  }
+
+  if (st.step === 'await_password') {
+    bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+    const email = st.data.email;
+    delete C1ST[uid];
+    const loading = await bot.sendMessage(chatId, '⏳ Signing in...');
+    try {
+      const lr = await cpm1Login(email, text);
+      if (!lr.ok) {
+        return bot.editMessageText(
+          `${CPM1_SEP}\n  ❌  LOGIN FAILED\n${CPM1_SEP}\n\n  ✗ ${lr.msg}\n\n  Tap below to retry.`,
+          { chat_id: chatId, message_id: loading.message_id, reply_markup: c1KB.login() }
+        );
+      }
+      await bot.editMessageText('⏳ Loading player data...', { chat_id: chatId, message_id: loading.message_id });
+      const record = await cpm1Load(lr.token, lr.uid);
+      if (!record?.Name) {
+        return bot.editMessageText('❌ Could not load CPM1 data.', { chat_id: chatId, message_id: loading.message_id, reply_markup: c1KB.login() });
+      }
+      C1S[uid] = { token: lr.token, firebaseUid: lr.uid, record, email };
+      return bot.editMessageText(c1Dashboard(C1S[uid]), { chat_id: chatId, message_id: loading.message_id, reply_markup: c1KB.home() });
+    } catch (e) {
+      return bot.editMessageText('❌ Error: ' + e.message, { chat_id: chatId, message_id: loading.message_id });
+    }
+  }
+
+  if (st.step === 'await_money') {
+    delete C1ST[uid];
+    const amt = parseInt(text.replace(/[,\s]/g, ''));
+    if (isNaN(amt) || amt < 1 || amt > CPM1_MAX_MONEY) {
+      return bot.sendMessage(chatId, `✗ Enter 1 – ${c1Fmt(CPM1_MAX_MONEY)}`, { reply_markup: c1KB.cancel() });
+    }
+    const sess = C1S[uid];
+    if (!sess) return;
+    const m = await bot.sendMessage(chatId, `⏳ Setting $${c1Fmt(amt)}...`);
+    const ok = await cpm1Save(sess.token, sess.firebaseUid, { ...sess.record, money: amt }, sess.record);
+    if (ok) { sess.record.money = amt; }
+    return bot.editMessageText(ok ? `✅ Money Set!\n\n💰 $${c1Fmt(amt)}` : '❌ Failed. Try /cpm1 again.', { chat_id: chatId, message_id: m.message_id, reply_markup: c1KB.back() });
+  }
+
+  if (st.step === 'await_coins') {
+    delete C1ST[uid];
+    const amt = parseInt(text.replace(/[,\s]/g, ''));
+    if (isNaN(amt) || amt < 1 || amt > CPM1_MAX_COIN) {
+      return bot.sendMessage(chatId, `✗ Enter 1 – ${c1Fmt(CPM1_MAX_COIN)}`, { reply_markup: c1KB.cancel() });
+    }
+    const sess = C1S[uid];
+    if (!sess) return;
+    const m = await bot.sendMessage(chatId, `⏳ Setting ${c1Fmt(amt)} coins...`);
+    const ok = await cpm1Save(sess.token, sess.firebaseUid, { ...sess.record, coin: amt }, sess.record);
+    if (ok) { sess.record.coin = amt; }
+    return bot.editMessageText(ok ? `✅ Coins Set!\n\n🪙 ${c1Fmt(amt)} coins` : '❌ Failed. Try /cpm1 again.', { chat_id: chatId, message_id: m.message_id, reply_markup: c1KB.back() });
+  }
+
+  if (st.step === 'await_name') {
+    delete C1ST[uid];
+    const sess = C1S[uid];
+    if (!sess) return;
+    const m = await bot.sendMessage(chatId, '⏳ Setting name...');
+    const ok = await cpm1SetName(sess.token, sess.firebaseUid, sess.record, text);
+    if (ok) sess.record.Name = text;
+    return bot.editMessageText(ok ? `✅ Name Updated!\n\n👤 ${text}` : '❌ Failed.', { chat_id: chatId, message_id: m.message_id, reply_markup: c1KB.back() });
+  }
+
+  if (st.step === 'await_pid') {
+    delete C1ST[uid];
+    const sess = C1S[uid];
+    if (!sess) return;
+    const m = await bot.sendMessage(chatId, '⏳ Setting Player ID...');
+    const ok = await cpm1SetPlayerID(sess.token, sess.firebaseUid, sess.record, text);
+    if (ok) sess.record.localID = text.toUpperCase();
+    return bot.editMessageText(ok ? `✅ Player ID Updated!\n\n🆔 ${text.toUpperCase()}` : '❌ Failed.', { chat_id: chatId, message_id: m.message_id, reply_markup: c1KB.back() });
+  }
+
+  if (st.step === 'await_wins') {
+    delete C1ST[uid];
+    const n = parseInt(text);
+    if (isNaN(n) || n < 0) return bot.sendMessage(chatId, '✗ Invalid number.', { reply_markup: c1KB.cancel() });
+    const sess = C1S[uid];
+    if (!sess) return;
+    const m = await bot.sendMessage(chatId, '⏳ Setting wins...');
+    const ok = await cpm1SetWins(sess.token, sess.firebaseUid, sess.record, n);
+    if (ok && sess.record.floats) sess.record.floats[8] = n;
+    return bot.editMessageText(ok ? `✅ Wins Updated!\n\n🏆 ${c1Fmt(n)} wins` : '❌ Failed.', { chat_id: chatId, message_id: m.message_id, reply_markup: c1KB.back() });
+  }
+
+  if (st.step === 'await_loses') {
+    delete C1ST[uid];
+    const n = parseInt(text);
+    if (isNaN(n) || n < 0) return bot.sendMessage(chatId, '✗ Invalid number.', { reply_markup: c1KB.cancel() });
+    const sess = C1S[uid];
+    if (!sess) return;
+    const m = await bot.sendMessage(chatId, '⏳ Setting loses...');
+    const ok = await cpm1SetLoses(sess.token, sess.firebaseUid, sess.record, n);
+    if (ok && sess.record.floats) sess.record.floats[9] = n;
+    return bot.editMessageText(ok ? `✅ Loses Updated!\n\n😞 ${c1Fmt(n)} loses` : '❌ Failed.', { chat_id: chatId, message_id: m.message_id, reply_markup: c1KB.back() });
+  }
+});
+
+// ── Callback query handler for CPM1 ──────────────────────────
+
+bot.on('callback_query', async (query) => {
+  const data   = query.data;
+  if (!data || !data.startsWith('c1_')) return;
+
+  const chatId = query.message.chat.id;
+  const msgId  = query.message.message_id;
+  const uid    = query.from.id;
+  const sess   = C1S[uid];
+
+  const edit = (text, kb) => bot.editMessageText(text, { chat_id: chatId, message_id: msgId, reply_markup: kb }).catch(() => {});
+  const answer = (txt) => bot.answerCallbackQuery(query.id, txt ? { text: txt } : {}).catch(() => {});
+
+  // ── Login flow
+  if (data === 'c1_login') {
+    C1ST[uid] = { step: 'await_email', data: {} };
+    await edit(`${CPM1_SEP}\n  📧  ENTER EMAIL\n${CPM1_SEP}\n\n  Type your CPM1 email:`, c1KB.cancel());
+    return answer();
+  }
+
+  // ── Cancel / Home
+  if (data === 'c1_cancel') {
+    delete C1ST[uid];
+    if (sess) await edit(c1Dashboard(sess), c1KB.home());
+    else await edit(`${CPM1_SEP}\n  🚗  CPM1 TOOL\n${CPM1_SEP}\n\n  Sign in to continue.`, c1KB.login());
+    return answer('✗ Cancelled');
+  }
+
+  if (data === 'c1_home') {
+    delete C1ST[uid];
+    if (!sess) { await edit('Please sign in first.', c1KB.login()); return answer(); }
+    await edit(c1Dashboard(sess), c1KB.home());
+    return answer();
+  }
+
+  // ── Refresh
+  if (data === 'c1_refresh') {
+    if (!sess) { await answer('Sign in first!'); return; }
+    await edit('⏳ Refreshing...', null);
+    try {
+      const record = await cpm1Load(sess.token, sess.firebaseUid);
+      if (record?.Name) { sess.record = record; await edit(c1Dashboard(sess), c1KB.home()); }
+      else await edit('❌ Could not refresh.', c1KB.back());
+    } catch(e) { await edit('❌ ' + e.message, c1KB.back()); }
+    return answer('🔄');
+  }
+
+  // ── Logout
+  if (data === 'c1_logout') {
+    await edit(`${CPM1_SEP}\n  🚪  SIGN OUT\n${CPM1_SEP}\n\n  Are you sure?`, c1KB.confirmLogout());
+    return answer();
+  }
+  if (data === 'c1_do_logout') {
+    delete C1S[uid]; delete C1ST[uid];
+    await edit(`${CPM1_SEP}\n  ✅  SIGNED OUT\n${CPM1_SEP}\n\n  Successfully signed out.`, c1KB.login());
+    return answer('✅');
+  }
+
+  // Require session for everything below
+  if (!sess) { await answer('Sign in first! Use /cpm1'); return; }
+
+  // ── Money menu
+  if (data === 'c1_money_menu') {
+    await edit(`${CPM1_SEP}\n  💰  MONEY\n${CPM1_SEP}\n\n  Max: $${c1Fmt(CPM1_MAX_MONEY)}`, c1KB.money());
+    return answer();
+  }
+  if (data === 'c1_m_custom') {
+    C1ST[uid] = { step: 'await_money', data: {} };
+    await edit(`${CPM1_SEP}\n  💰  CUSTOM AMOUNT\n${CPM1_SEP}\n\n  Enter amount (1 – ${c1Fmt(CPM1_MAX_MONEY)}):`, c1KB.cancel());
+    return answer();
+  }
+  if (data.startsWith('c1_m_')) {
+    const amt = parseInt(data.replace('c1_m_', ''));
+    await edit(`⏳ Setting $${c1Fmt(amt)}...`, null);
+    const ok = await cpm1Save(sess.token, sess.firebaseUid, { ...sess.record, money: amt }, sess.record);
+    if (ok) sess.record.money = amt;
+    await edit(ok ? `✅ Money Set!\n\n💰 $${c1Fmt(amt)}` : '❌ Failed. Try Refresh.', c1KB.back());
+    return answer();
+  }
+
+  // ── Coins menu
+  if (data === 'c1_coins_menu') {
+    await edit(`${CPM1_SEP}\n  🪙  COINS\n${CPM1_SEP}\n\n  Max: ${c1Fmt(CPM1_MAX_COIN)}`, c1KB.coins());
+    return answer();
+  }
+  if (data === 'c1_c_custom') {
+    C1ST[uid] = { step: 'await_coins', data: {} };
+    await edit(`${CPM1_SEP}\n  🪙  CUSTOM AMOUNT\n${CPM1_SEP}\n\n  Enter amount (1 – ${c1Fmt(CPM1_MAX_COIN)}):`, c1KB.cancel());
+    return answer();
+  }
+  if (data.startsWith('c1_c_')) {
+    const amt = parseInt(data.replace('c1_c_', ''));
+    await edit(`⏳ Setting ${c1Fmt(amt)} coins...`, null);
+    const ok = await cpm1Save(sess.token, sess.firebaseUid, { ...sess.record, coin: amt }, sess.record);
+    if (ok) sess.record.coin = amt;
+    await edit(ok ? `✅ Coins Set!\n\n🪙 ${c1Fmt(amt)} coins` : '❌ Failed. Try Refresh.', c1KB.back());
+    return answer();
+  }
+
+  // ── Features menu
+  if (data === 'c1_feat_menu') {
+    await edit(`${CPM1_SEP}\n  ⚡  FEATURES\n${CPM1_SEP}\n\n  Select a feature:`, c1KB.feat());
+    return answer();
+  }
+
+  const featMap = {
+    'c1_f_w16':    ['🚗 W16 Engine',    () => cpm1UnlockW16(sess.token, sess.firebaseUid, sess.record)],
+    'c1_f_horns':  ['🔊 Horns',         () => cpm1UnlockHorns(sess.token, sess.firebaseUid, sess.record)],
+    'c1_f_damage': ['🛡 No Damage',     () => cpm1DisableDamage(sess.token, sess.firebaseUid, sess.record)],
+    'c1_f_fuel':   ['⛽ Unlimited Fuel', () => cpm1UnlimitedFuel(sess.token, sess.firebaseUid, sess.record)],
+    'c1_f_smoke':  ['💨 Smoke',         () => cpm1UnlockSmoke(sess.token, sess.firebaseUid, sess.record)],
+    'c1_f_anims':  ['🎭 Animations',    () => cpm1UnlockAnimations(sess.token, sess.firebaseUid, sess.record)],
+    'c1_f_wheels': ['🛞 Wheels',        () => cpm1UnlockWheels(sess.token, sess.firebaseUid, sess.record)],
+    'c1_f_houses': ['🏠 Houses',        () => cpm1UnlockHouses(sess.token, sess.firebaseUid, sess.record)],
+    'c1_f_levels': ['🎮 All Levels',    () => cpm1CompleteLevels(sess.token, sess.firebaseUid, sess.record)],
+    'c1_f_rank':   ['🏅 Max Rank',      () => cpm1SetRank(sess.token)],
+  };
+
+  if (featMap[data]) {
+    const [name, fn] = featMap[data];
+    await edit(`⏳ Applying ${name}...`, null);
+    const ok = await fn();
+    await edit(ok ? `✅ ${name} Done!\n\nRestart game to see changes.` : `❌ ${name} Failed. Try Refresh.`, c1KB.back());
+    return answer();
+  }
+
+  // ── Unlock ALL
+  if (data === 'c1_f_all') {
+    const allFeats = Object.entries(featMap);
+    let done = 0, failed = 0;
+    const results = [];
+    for (let i = 0; i < allFeats.length; i++) {
+      const [, [name, fn]] = allFeats[i];
+      const pct = Math.round(((i+1)/allFeats.length)*100);
+      const bar = '▰'.repeat(Math.floor(pct/7)) + '▱'.repeat(15-Math.floor(pct/7));
+      await edit(`${CPM1_SEP}\n  🚀  UNLOCK ALL\n${CPM1_SEP}\n\n  [${bar}] ${pct}%\n  ✔ ${done}  ✗ ${failed}  ▸ ${i+1}/${allFeats.length}\n\n  ⏳ ${name}`, null).catch(()=>{});
+      const ok = await fn();
+      if (ok) { done++; results.push(`  ✔ ${name}`); } else { failed++; results.push(`  ✗ ${name}`); }
+    }
+    await edit(`${CPM1_SEP}\n  🎉  COMPLETE\n${CPM1_SEP}\n\n  [▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰] 100%\n\n  ✔ ${done}/${allFeats.length}  ✗ ${failed}/${allFeats.length}\n\n${results.join('\n')}`, c1KB.back());
+    return answer();
+  }
+
+  // ── Settings menu
+  if (data === 'c1_set_menu') {
+    await edit(`${CPM1_SEP}\n  🔧  SETTINGS\n${CPM1_SEP}\n\n  Modify your account:`, c1KB.settings());
+    return answer();
+  }
+  if (data === 'c1_s_name') {
+    C1ST[uid] = { step: 'await_name', data: {} };
+    await edit(`${CPM1_SEP}\n  ✏️  CHANGE NAME\n${CPM1_SEP}\n\n  Enter new name:`, c1KB.cancel());
+    return answer();
+  }
+  if (data === 'c1_s_pid') {
+    C1ST[uid] = { step: 'await_pid', data: {} };
+    await edit(`${CPM1_SEP}\n  🆔  PLAYER ID\n${CPM1_SEP}\n\n  Enter new Player ID:`, c1KB.cancel());
+    return answer();
+  }
+  if (data === 'c1_s_wins') {
+    C1ST[uid] = { step: 'await_wins', data: {} };
+    await edit(`${CPM1_SEP}\n  🏆  SET WINS\n${CPM1_SEP}\n\n  Enter win count:`, c1KB.cancel());
+    return answer();
+  }
+  if (data === 'c1_s_loses') {
+    C1ST[uid] = { step: 'await_loses', data: {} };
+    await edit(`${CPM1_SEP}\n  😞  SET LOSES\n${CPM1_SEP}\n\n  Enter loss count:`, c1KB.cancel());
+    return answer();
+  }
+  if (data === 'c1_s_fix') {
+    await edit('⏳ Loading & fixing account...', null);
+    const result = await cpm1FixAccount(sess.token, sess.firebaseUid, sess.record);
+    if (result.ok) sess.record = (await cpm1Load(sess.token, sess.firebaseUid)) || sess.record;
+    await edit(result.ok ? `✅ Account Fixed!\n\n🔧 ${result.bugs} bugs fixed` : '❌ Fix failed.', c1KB.back());
+    return answer();
+  }
+});
+
+/* ── Game picker callbacks ── */
+bot.on('callback_query', async (query) => {
+  if (!query.data) return;
+  const chatId = query.message.chat.id;
+  const msgId  = query.message.message_id;
+  const uid    = query.from.id;
+
+  if (query.data === 'pick_cpm1') {
+    const sess = cpm1Sessions[uid];
+    const txt = sess
+      ? c1Dashboard(sess)
+      : `${CPM1_SEP}\n  🚗  CPM1 TOOL\n${CPM1_SEP}\n\n  Sign in with your CPM1 credentials\n  to access money, coins, and all features.`;
+    const kb = sess ? c1KB.home() : c1KB.login();
+    await bot.editMessageText(txt, { chat_id: chatId, message_id: msgId, reply_markup: kb, parse_mode: 'Markdown' }).catch(() => {});
+    return bot.answerCallbackQuery(query.id).catch(() => {});
+  }
+
+  if (query.data === 'pick_cpm2') {
+    const PRICE_COINS = parseInt(process.env.PRICE_COINS) || 150;
+    await bot.editMessageText(
+`╔═══════════════════╗
+   🏎  *CPM 2 STORE*  🏎
+╚═══════════════════╝
+
+┌─────────────────────┐
+│  💎  *WHAT YOU GET*  💎  │
+├─────────────────────┤
+│ 🪙  300 Coins            │
+│ 🚗  10–20 Cars           │
+│ 👑  King Rank             │
+│ 🔓  All Cars Unlocked  │
+│ 🎨  All Paintings         │
+│ 💡  All Headlights        │
+│ 👕  Full Clothes Set      │
+│ 🎬  All Animations        │
+└─────────────────────┘
+
+💰 Price: *${PRICE_COINS} Coins* per account`,
+      {
+        chat_id: chatId, message_id: msgId, parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '💳 Payment Info', callback_data: 'menu_pay' },   { text: '🪙 My Wallet',  callback_data: 'menu_wallet' }],
+            [{ text: '🎮 Claim Account', callback_data: 'menu_claim' }, { text: '🔑 Buy Ref',    callback_data: 'menu_buyref' }],
+            [{ text: '🏆 Leaderboard',  callback_data: 'menu_top' },   { text: '🏅 My Rank',    callback_data: 'menu_rank'   }],
+            [{ text: '📟 Full Menu',    callback_data: 'menu_full' },   { text: '◂ Back',        callback_data: 'pick_back'   }],
+          ]
+        }
+      }
+    ).catch(() => {});
+    return bot.answerCallbackQuery(query.id).catch(() => {});
+  }
+
+  if (query.data === 'pick_back') {
+    await bot.editMessageText(
+`╔═══════════════════╗
+   🎮  *KALYPO MODS*  🎮
+╚═══════════════════╝
+
+Welcome! Choose your game:`,
+      {
+        chat_id: chatId, message_id: msgId, parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [[
+          { text: '🚗 CPM 1 Tool',  callback_data: 'pick_cpm1' },
+          { text: '🏎 CPM 2 Store', callback_data: 'pick_cpm2' },
+        ]]}
+      }
+    ).catch(() => {});
+    return bot.answerCallbackQuery(query.id).catch(() => {});
+  }
+});
